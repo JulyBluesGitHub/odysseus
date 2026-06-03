@@ -127,7 +127,7 @@ def _execute_create_task_actions(db, parent_task, actions: list) -> int:
     for action in actions:
         if action.type != "create_task":
             continue
-        if not action.role or action.role not in (VALID_ROLES if False else VALID_ROLES):  # always True
+        if not action.role or action.role not in {"diagnoser", "implementer", "verifier"}:
             _record_event(
                 db, parent_task.id, "coordinator", "error",
                 summary=f"Skipped create_task: invalid or missing role '{action.role}'",

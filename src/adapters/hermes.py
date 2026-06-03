@@ -32,9 +32,7 @@ For each task you receive:
 1. The task TITLE is the primary instruction. If the objective field is empty, use the title as your directive.
 2. Read the event history for context from previous steps.
 3. Produce a thoughtful response addressing the task.
-4. If the task requires creating or modifying files, propose file_write actions.
-5. If the task requires running commands, propose shell actions.
-6. End your response with [STATUS: xxx] followed by an optional [ACTIONS] block.
+4. End your response with [STATUS: xxx] followed by an optional [ACTIONS] block.
 
 Valid statuses:
 - done — task completed, no further actions needed
@@ -42,17 +40,20 @@ Valid statuses:
 - blocked — task CANNOT be completed (missing critical info, impossible request). Do NOT block just because the objective field is empty — use the title.
 - queued — needs another agent or retry
 
-If you propose actions, use [STATUS: waiting_for_approval] and add a JSON [ACTIONS] block:
+IMPORTANT: create_task actions. When asked to spawn subtasks for other agent roles (diagnoser, implementer, verifier), use create_task actions in the [ACTIONS] block. Each create_task action becomes a real queued task that other agents will pick up. Do NOT use file_write or shell actions to describe subtask work — use create_task for that.
+
 [ACTIONS]
+{"type": "create_task", "label": "Spawn implementation", "role": "implementer", "title": "Implement X", "objective": "Detailed instructions for the implementer", "depends_on": "parent-task-id"}
 {"type": "file_write", "label": "Create main.py", "path": "src/main.py", "content": "print('hello')"}
 {"type": "shell", "label": "Run the script", "command": "python src/main.py"}
-{"type": "create_task", "label": "Spawn implementation", "role": "implementer", "title": "Implement X", "objective": "...", "depends_on": ["parent-task-id"]}
 
-create_task action fields:
+create_task fields:
 - role (required): diagnoser, implementer, or verifier
 - title (required): short task title
 - objective (optional): detailed instructions for the child task
-- depends_on (optional): list of task IDs the child must wait for
+- depends_on (optional): task ID this subtask must wait for (string, not array — use the current task's ID)
+
+file_write / shell actions are for YOUR work only. Use create_task to delegate to other roles.
 
 Rules for actions:
 - file_write: path is relative to the project root. Include the full file content.
@@ -208,9 +209,9 @@ def _extract_actions(text: str) -> list:
                 content=obj.get("content", ""),
                 workdir=obj.get("workdir"),
                 role=obj.get("role", ""),
-                task_title=obj.get("title", ""),
-                objective=obj.get("objective", ""),
-                depends_on=obj.get("depends_on", []),
+                task_title=obj.get("title") or obj.get("description", ""),
+                objective=obj.get("objective") or obj.get("details", ""),
+                depends_on=obj.get("depends_on") if isinstance(obj.get("depends_on"), list) else ([obj["depends_on"]] if isinstance(obj.get("depends_on"), str) and obj.get("depends_on") else []),
             )
             # Only include valid action types
             if action.type in ("shell", "file_write", "file_read", "create_task"):
