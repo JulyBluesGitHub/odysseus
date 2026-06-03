@@ -26,6 +26,7 @@ import uuid
 from datetime import datetime, timezone
 
 from core.database import SessionLocal, AgentTask, AgentEvent
+from src.agent_hub_events import publish as _publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,18 @@ POLL_INTERVAL = float(os.getenv("AGENT_HUB_POLL_INTERVAL", "5"))
 
 MAX_ATTEMPTS = 3
 """Max dispatch attempts before a task is marked blocked."""
+
+
+def _publish_task(task_id: str) -> None:
+    """Re-fetch a task from DB and publish a task_updated event to its owner."""
+    from src.agent_hub_events import _task_to_ssedict
+    db = SessionLocal()
+    try:
+        task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
+        if task:
+            _publish_event(task.owner or "", "task_updated", _task_to_ssedict(task))
+    finally:
+        db.close()
 
 
 # ── Transition table ──────────────────────────────────────────────────────────
@@ -187,6 +200,7 @@ async def _tick():
         )
         db.commit()
         db.refresh(task)
+        _publish_task(task.id)
     finally:
         db.close()
 
@@ -267,6 +281,7 @@ async def _tick():
         # Release lock (keep locked_at for timing — poll only checks locked_by)
         task.locked_by = None
         db2.commit()
+        _publish_task(task.id)
         _tasks_processed += 1
 
         # Chain: if task completed and has a chain_task_id, auto-create the next one
@@ -322,6 +337,13 @@ def _release_all_locks():
     try:
         db = SessionLocal()
         try:
+            # Fetch locked task IDs before releasing
+            locked_ids = [
+                row[0] for row in
+                db.query(AgentTask.id)
+                .filter(AgentTask.locked_by.isnot(None))
+                .all()
+            ]
             updated = (
                 db.query(AgentTask)
                 .filter(AgentTask.locked_by.isnot(None))
@@ -335,6 +357,8 @@ def _release_all_locks():
                 logger.info(
                     "Agent Hub: released %d lock(s) on shutdown", updated
                 )
+                for tid in locked_ids:
+                    _publish_task(tid)
         finally:
             db.close()
     except Exception:
@@ -399,6 +423,7 @@ def _activate_chain(db, completed_task):
         ),
     )
     db.commit()
+    _publish_task(next_task.id)
     logger.info(
         "Agent Hub: chain activated %s → %s",
         completed_task.id, next_task.id,
@@ -496,6 +521,7 @@ def execute_pending_actions(task_id: str) -> list[dict]:
         meta["actions_pending"] = False
         event.metadata_json = _json.dumps(meta, default=str)
         db.commit()
+        _publish_task(task_id)
     finally:
         db.close()
 

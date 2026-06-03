@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from core.database import SessionLocal, AgentTask, AgentEvent
@@ -170,6 +170,31 @@ def _validate_transition(current_status: str, new_status: str, locked_by: str | 
 def setup_agent_hub_routes() -> APIRouter:
     router = APIRouter(prefix="/api/agent-hub", tags=["agent-hub"])
 
+    # ── SSE stream ──────────────────────────────────────────────────────────
+
+    @router.get("/stream")
+    async def agent_hub_stream(request: Request):
+        """SSE event stream for Agent Hub — push task updates to the UI.
+
+        The client receives an ``init`` event with all its tasks, then live
+        ``task_created``, ``task_updated``, ``task_deleted``, ``event_created``,
+        and ``coordinator_status`` events as they happen.  Only the
+        authenticated user's own tasks are sent.
+        """
+        from src.agent_hub_events import subscribe as _ev_subscribe
+        from src.auth_helpers import get_current_user
+
+        user = get_current_user(request)
+        return StreamingResponse(
+            _ev_subscribe(user or "", request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     # ── Task CRUD ─────────────────────────────────────────────────────────
 
     @router.get("/tasks")
@@ -232,7 +257,11 @@ def setup_agent_hub_routes() -> APIRouter:
             db.add(task)
             db.commit()
             db.refresh(task)
-            return _task_to_dict(task)
+            result = _task_to_dict(task)
+            # Publish after commit succeeds
+            from src.agent_hub_events import publish
+            publish(user or "", "task_created", result)
+            return result
         finally:
             db.close()
 
@@ -296,7 +325,10 @@ def setup_agent_hub_routes() -> APIRouter:
 
             db.commit()
             db.refresh(task)
-            return _task_to_dict(task)
+            result = _task_to_dict(task)
+            from src.agent_hub_events import publish
+            publish(user or "", "task_updated", result)
+            return result
         finally:
             db.close()
 
@@ -313,6 +345,8 @@ def setup_agent_hub_routes() -> APIRouter:
                 raise HTTPException(404, "Task not found")
             db.delete(task)
             db.commit()
+            from src.agent_hub_events import publish
+            publish(user or "", "task_deleted", {"id": task_id})
             return {"ok": True}
         finally:
             db.close()
@@ -343,6 +377,10 @@ def setup_agent_hub_routes() -> APIRouter:
             )
             db.commit()
             db.refresh(event)
+            db.refresh(task)
+            # Publish event_created with full task snapshot for timeline update
+            from src.agent_hub_events import publish
+            publish(user or "", "event_created", _task_to_dict(task))
             return _event_to_dict(event)
         finally:
             db.close()
@@ -375,7 +413,10 @@ def setup_agent_hub_routes() -> APIRouter:
                                   (f" (was {old_owner})" if old_owner and old_owner != body.current_owner else ""))
             db.commit()
             db.refresh(task)
-            return _task_to_dict(task)
+            result = _task_to_dict(task)
+            from src.agent_hub_events import publish
+            publish(user or "", "task_updated", result)
+            return result
         finally:
             db.close()
 
@@ -411,6 +452,9 @@ def setup_agent_hub_routes() -> APIRouter:
                 _activate_chain(db, task)
 
             db.refresh(task)
+            # Publish task update after approval + chain activation
+            from src.agent_hub_events import publish
+            publish(user or "", "task_updated", _task_to_dict(task))
         finally:
             db.close()
 
@@ -461,7 +505,10 @@ def setup_agent_hub_routes() -> APIRouter:
 
             db.commit()
             db.refresh(task)
-            return _task_to_dict(task)
+            result = _task_to_dict(task)
+            from src.agent_hub_events import publish
+            publish(user or "", "task_updated", result)
+            return result
         finally:
             db.close()
 

@@ -122,7 +122,7 @@ class TestCoordinatorTick:
             assert t is not None
             assert t.status == "done"
             assert t.locked_by is None
-            assert t.locked_at is None
+            assert t.locked_at is not None  # kept for timing
             assert t.current_owner == "user"
 
             events = (

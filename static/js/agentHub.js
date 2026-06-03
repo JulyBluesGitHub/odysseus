@@ -3,7 +3,11 @@
  *
  * Two-pane layout: task list (left) + selected task detail / timeline (right).
  * Registers with modalManager so the sidebar button toggles minimize/restore/close.
- * Polls the task list every 5s while open.
+ *
+ * Live updates via SSE (GET /api/agent-hub/stream) — replaces 5s polling.
+ * Client-side task cache (_taskMap) enables instant filtering without re-fetch.
+ * Separate list-level timer interval so row timers keep ticking even when no
+ * task is selected (previously _stopTimer() on deselect froze list timers).
  *
  * Exports: { openAgentHub, closeAgentHub, isAgentHubOpen }
  */
@@ -12,16 +16,17 @@ import * as Modals from './modalManager.js';
 import { makeWindowDraggable } from './windowDrag.js';
 
 const API_BASE = window.location.origin;
-const POLL_INTERVAL_MS = 5000;
+const FALLBACK_POLL_MS = 10000;  // slow poll only while EventSource is errored
 
 const MODAL_ID = 'agent-hub-modal';
 
 let _open = false;
 let _selectedTaskId = null;
-let _pollInterval = null;
-let _listRefreshPending = false;
-let _timerInterval = null;
-let _runningSince = null;  // ISO timestamp when current task was locked
+let _taskMap = new Map();            // taskId → full task object
+let _eventSource = null;             // SSE connection
+let _fallbackPoll = null;            // polling fallback when SSE errors
+let _listTimerInterval = null;       // 1s tick for all visible row timers
+let _detailTimerSince = null;        // ISO timestamp for selected task's running timer
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -42,9 +47,9 @@ export function openAgentHub() {
     closeFn: () => _teardown(),
     restoreFn: () => {},
   });
-  _fetchAndRender();
-  _startPolling();
-  _startTimer();  // always tick — list timers need it even without a selected task
+  _startSSE();
+  _startListTimer();  // always tick — list timers need it even without a selected task
+  _fetchAndRender();   // initial data load (SSE init may arrive first, but belt-and-suspenders)
 }
 
 export function closeAgentHub() {
@@ -115,7 +120,7 @@ function _getModal() {
     </div>
   `;
   document.body.appendChild(modal);
-  // Enable drag + resize (must pass content + header elements)
+  // Enable drag + resize
   const _content = modal.querySelector('.ah-modal-content');
   const _header = modal.querySelector('.ah-header');
   if (_content && _header) {
@@ -132,19 +137,20 @@ function _getModal() {
   modal.querySelector('.modal-minimize-btn').addEventListener('click', () => {
     Modals.minimize(MODAL_ID);
     _open = false;
-    _stopPolling();
+    _stopSSE();
+    _stopListTimer();
   });
   modal.querySelector('.ah-refresh-btn').addEventListener('click', () => _fetchAndRender());
   modal.querySelector('#ah-new-task-btn').addEventListener('click', () => _showNewTaskForm());
-  modal.querySelector('#ah-status-filter').addEventListener('change', () => _fetchAndRender());
-  modal.querySelector('#ah-owner-filter').addEventListener('change', () => _fetchAndRender());
+  modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
+  modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
 
   // Debounced keyword search
   const searchInput = modal.querySelector('#ah-search-input');
   let _searchTimer = null;
   searchInput.addEventListener('input', () => {
     clearTimeout(_searchTimer);
-    _searchTimer = setTimeout(() => _fetchAndRender(), 300);
+    _searchTimer = setTimeout(() => _renderFromCache(), 300);
   });
 
   // ── Splitter drag ──
@@ -153,7 +159,118 @@ function _getModal() {
   return modal;
 }
 
-// ── Data fetching ─────────────────────────────────────────────────────────────
+// ── SSE ───────────────────────────────────────────────────────────────────────
+
+function _startSSE() {
+  _stopSSE();
+  try {
+    _eventSource = new EventSource(`${API_BASE}/api/agent-hub/stream`);
+  } catch (_) {
+    _startFallbackPoll();
+    return;
+  }
+
+  _eventSource.addEventListener('init', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      _taskMap.clear();
+      for (const t of (data.tasks || [])) {
+        _taskMap.set(t.id, t);
+      }
+      _renderFromCache();
+      _renderCoordinatorStatus();
+      if (_selectedTaskId) {
+        const cached = _taskMap.get(_selectedTaskId);
+        if (cached) {
+          _renderTaskDetail(cached);
+          _updateDetailTimerState(cached);
+        } else {
+          _selectedTaskId = null;
+          _renderEmptyDetail();
+        }
+      }
+      // SSE is healthy — stop any fallback poll
+      _stopFallbackPoll();
+    } catch (_) {}
+  });
+
+  _eventSource.addEventListener('task_created', (e) => {
+    try {
+      const t = JSON.parse(e.data);
+      _taskMap.set(t.id, t);
+      _renderFromCache();
+    } catch (_) {}
+  });
+
+  _eventSource.addEventListener('task_updated', (e) => {
+    try {
+      const t = JSON.parse(e.data);
+      _taskMap.set(t.id, t);
+      _renderFromCache();
+      // If this is the selected task, update the detail view surgically
+      if (_selectedTaskId === t.id) {
+        _renderTaskDetail(t);
+        _updateDetailTimerState(t);
+      }
+    } catch (_) {}
+  });
+
+  _eventSource.addEventListener('task_deleted', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      _taskMap.delete(data.id);
+      _renderFromCache();
+      if (_selectedTaskId === data.id) {
+        _selectedTaskId = null;
+        _renderEmptyDetail();
+        _detailTimerSince = null;
+      }
+    } catch (_) {}
+  });
+
+  _eventSource.addEventListener('event_created', (e) => {
+    try {
+      const t = JSON.parse(e.data);
+      _taskMap.set(t.id, t);
+      if (_selectedTaskId === t.id) {
+        _renderTaskDetail(t);
+      }
+      // Re-render list for badge / timer updates
+      _renderFromCache();
+    } catch (_) {}
+  });
+
+  _eventSource.addEventListener('coordinator_status', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      _renderCoordinatorStatusFromData(data);
+    } catch (_) {}
+  });
+
+  _eventSource.onerror = () => {
+    // EventSource auto-reconnects, but also start fallback polling
+    _startFallbackPoll();
+  };
+}
+
+function _stopSSE() {
+  if (_eventSource) {
+    _eventSource.close();
+    _eventSource = null;
+  }
+  _stopFallbackPoll();
+}
+
+function _startFallbackPoll() {
+  _stopFallbackPoll();
+  _fallbackPoll = setInterval(() => _fetchAndRender(), FALLBACK_POLL_MS);
+}
+
+function _stopFallbackPoll() {
+  if (_fallbackPoll) { clearInterval(_fallbackPoll); _fallbackPoll = null; }
+}
+
+// ── Data fetching (manual refresh + fallback) ─────────────────────────────────
 
 async function _fetchTasks() {
   const statusEl = document.getElementById('ah-status-filter');
@@ -171,6 +288,11 @@ async function _fetchTasks() {
     const res = await fetch(url, { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    // Sync cache
+    _taskMap.clear();
+    for (const t of (data.tasks || [])) {
+      _taskMap.set(t.id, t);
+    }
     return data.tasks || [];
   } catch (e) {
     console.warn('Agent Hub: fetch tasks failed', e);
@@ -182,7 +304,9 @@ async function _fetchTask(taskId) {
   try {
     const res = await fetch(`${API_BASE}/api/agent-hub/tasks/${taskId}`, { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    const task = await res.json();
+    _taskMap.set(task.id, task);  // update cache
+    return task;
   } catch (e) {
     console.warn('Agent Hub: fetch task failed', e);
     return null;
@@ -197,17 +321,60 @@ async function _fetchStatus() {
   return null;
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────────
+// ── Client-side filtering + rendering ─────────────────────────────────────────
 
 async function _fetchAndRender() {
   const tasks = await _fetchTasks();
   _renderTaskList(tasks);
   _renderCoordinatorStatus();
+  _updateBadge(tasks);
   if (_selectedTaskId) {
     const task = await _fetchTask(_selectedTaskId);
-    if (task) _renderTaskDetail(task);
-    else { _selectedTaskId = null; _renderEmptyDetail(); }
+    if (task) {
+      _renderTaskDetail(task);
+      _updateDetailTimerState(task);
+    } else { _selectedTaskId = null; _renderEmptyDetail(); }
   }
+}
+
+function _getFilteredTasks() {
+  const statusEl = document.getElementById('ah-status-filter');
+  const ownerEl = document.getElementById('ah-owner-filter');
+  const searchEl = document.getElementById('ah-search-input');
+  const status = statusEl?.value || '';
+  const owner = ownerEl?.value || '';
+  const search = (searchEl?.value || '').trim().toLowerCase();
+
+  let tasks = Array.from(_taskMap.values());
+
+  if (status) {
+    tasks = tasks.filter(t => t.status === status);
+  }
+  if (owner) {
+    tasks = tasks.filter(t => t.current_owner === owner);
+  }
+  if (search) {
+    tasks = tasks.filter(t =>
+      (t.title || '').toLowerCase().includes(search) ||
+      (t.objective || '').toLowerCase().includes(search)
+    );
+  }
+
+  // Sort by updated_at descending
+  tasks.sort((a, b) => {
+    const da = a.updated_at ? new Date(a.updated_at) : 0;
+    const db = b.updated_at ? new Date(b.updated_at) : 0;
+    return db - da;
+  });
+
+  return tasks;
+}
+
+function _renderFromCache() {
+  const tasks = _getFilteredTasks();
+  _renderTaskList(tasks);
+  _updateBadge(tasks);
+  _tickAllListTimers();  // populate fresh timer spans immediately
 }
 
 function _renderTaskList(tasks) {
@@ -243,7 +410,6 @@ function _renderTaskList(tasks) {
   container.querySelectorAll('.ah-task-item').forEach(el => {
     el.addEventListener('click', () => _selectTask(el.dataset.taskId));
   });
-  // Delete buttons (stop propagation so they don't trigger selection)
   container.querySelectorAll('.ah-task-delete-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -390,7 +556,6 @@ function _renderTaskDetail(task) {
     approveBtn.addEventListener('click', async () => {
       const result = await _apiCall('POST', `/api/agent-hub/tasks/${task.id}/approve`);
       _selectTask(task.id);
-      // Show a brief toast with action results
       if (result && result.action_results && result.action_results.length) {
         _showToast(`Executed ${result.action_results.length} action(s): ${
           result.action_results.map(r => (r.success ? 'OK' : 'FAIL') + ' ' + r.label).join(', ')
@@ -452,19 +617,17 @@ function _renderTaskDetail(task) {
     if (label) label.textContent = '(none)';
   }
 
-  // Find which task triggers THIS one (reverse lookup from the list)
-  _fetchTasks().then(allTasks => {
-    const parent = allTasks.find(t => t.chain_task_id === task.id);
-    const parentLabel = document.getElementById('ah-chain-parent-label');
-    if (parentLabel && parent) {
-      parentLabel.innerHTML = `<a class="ah-chain-link" href="#">${_esc(parent.title || parent.id)}</a>`;
-      parentLabel.querySelector('a').addEventListener('click', (e) => {
-        e.preventDefault(); _selectTask(parent.id);
-      });
-    } else if (parentLabel) {
-      parentLabel.textContent = '(none)';
-    }
-  });
+  // Find which task triggers THIS one (reverse lookup from cache)
+  const parent = Array.from(_taskMap.values()).find(t => t.chain_task_id === task.id);
+  const parentLabel = document.getElementById('ah-chain-parent-label');
+  if (parentLabel && parent) {
+    parentLabel.innerHTML = `<a class="ah-chain-link" href="#">${_esc(parent.title || parent.id)}</a>`;
+    parentLabel.querySelector('a').addEventListener('click', (e) => {
+      e.preventDefault(); _selectTask(parent.id);
+    });
+  } else if (parentLabel) {
+    parentLabel.textContent = '(none)';
+  }
 }
 
 function _renderEmptyDetail() {
@@ -473,15 +636,19 @@ function _renderEmptyDetail() {
 }
 
 async function _renderCoordinatorStatus() {
+  const status = await _fetchStatus();
+  _renderCoordinatorStatusFromData(status);
+}
+
+function _renderCoordinatorStatusFromData(status) {
   const el = document.getElementById('ah-coordinator-status');
   if (!el) return;
-  const status = await _fetchStatus();
   if (status && status.running) {
     el.innerHTML = '<span class="ah-status-live">● Live</span>';
     el.title = `Tasks: ${status.tasks_total || 0}, Last tick: ${status.last_tick || 'N/A'}`;
   } else {
     el.innerHTML = '<span class="ah-status-idle">○ Idle</span>';
-    el.title = 'Coordinator not running (Slice 2B)';
+    el.title = 'Coordinator not running';
   }
 }
 
@@ -491,6 +658,7 @@ function _showNewTaskForm() {
   const container = document.getElementById('ah-task-detail');
   if (!container) return;
   _selectedTaskId = null;
+  _detailTimerSince = null;
   container.innerHTML = `
     <div class="ah-new-task-form">
       <h3>New Task</h3>
@@ -536,12 +704,10 @@ function _showNewTaskForm() {
     </div>
   `;
 
-  // Template buttons
   container.querySelectorAll('.ah-template-btn').forEach(btn => {
     btn.addEventListener('click', () => _applyTemplate(btn.dataset.template));
   });
 
-  // Sandbox danger warning toggle
   const sandboxSelect = document.getElementById('ah-new-sandbox');
   const sandboxWarning = document.getElementById('ah-sandbox-warning');
   if (sandboxSelect && sandboxWarning) {
@@ -561,7 +727,6 @@ function _showNewTaskForm() {
     if (owner && owner !== 'user') body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);
     if (task) {
-      // If triggered by a previous task, set THAT task's chain to point here
       if (chainId) {
         await _apiCall('PUT', `/api/agent-hub/tasks/${chainId}`, { chain_task_id: task.id });
       }
@@ -605,7 +770,6 @@ function _applyTemplate(name) {
   if (titleEl) titleEl.value = tpl.title;
   if (objEl) objEl.value = tpl.objective;
   if (phaseEl && tpl.phase) phaseEl.value = tpl.phase;
-  // Highlight active template
   document.querySelectorAll('.ah-template-btn').forEach(b => {
     b.classList.toggle('ah-template-btn--active', b.dataset.template === name);
   });
@@ -615,189 +779,38 @@ function _applyTemplate(name) {
 
 async function _selectTask(taskId) {
   _selectedTaskId = taskId;
-  _stopTimer();
-  const task = await _fetchTask(taskId);
+  const task = _taskMap.get(taskId) || await _fetchTask(taskId);
   if (!task) { _selectedTaskId = null; _renderEmptyDetail(); return; }
   _renderTaskDetail(task);
-  // Start timer immediately if task is running
-  if (task.status === 'running' && task.locked_at) {
-    _runningSince = task.locked_at;
-    _startTimer();
-  }
+  _updateDetailTimerState(task);
   // Update list highlight
   document.querySelectorAll('.ah-task-item').forEach(el => {
     el.classList.toggle('ah-task-item--active', el.dataset.taskId === taskId);
   });
 }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
-
-function _startPolling() {
-  _stopPolling();
-  _pollInterval = setInterval(() => {
-    if (!_listRefreshPending) {
-      _listRefreshPending = true;
-      _fetchTasks().then(tasks => {
-        _renderTaskList(tasks);
-        _updateBadge(tasks);
-        _tickAllTimers();  // populate fresh timer spans immediately
-        _listRefreshPending = false;
-      });
-    }
-    // Also refresh the selected task's timeline live
-    if (_selectedTaskId) {
-      _refreshSelectedTask();
-    }
-  }, POLL_INTERVAL_MS);
-  // Initial badge fetch
-  _fetchTasks().then(tasks => _updateBadge(tasks));
-}
-
-function _stopPolling() {
-  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
-}
-
-async function _refreshSelectedTask() {
-  if (!_selectedTaskId) return;
-  const task = await _fetchTask(_selectedTaskId);
-  if (!task) return;
-
-  // Update status / meta badges (surgical, no innerHTML wipe)
-  const statusEl = document.querySelector('.ah-detail-status');
-  if (statusEl) {
-    statusEl.innerHTML = `${_statusDot(task.status)} ${task.status}`;
-  }
-  const lockedEl = document.querySelector('.ah-detail-locked');
-  if (lockedEl) {
-    lockedEl.style.display = task.locked_by ? '' : 'none';
-    if (task.locked_by) lockedEl.textContent = `Locked by ${task.locked_by}`;
-  }
-  const attemptsEl = document.querySelector('.ah-detail-attempts');
-  if (attemptsEl) {
-    attemptsEl.style.display = task.attempt_count > 0 ? '' : 'none';
-    if (task.attempt_count > 0) attemptsEl.textContent = `Attempt ${task.attempt_count}`;
-  }
-  const sandboxEl = document.querySelector('.ah-detail-sandbox');
-  if (sandboxEl) {
-    sandboxEl.textContent = `Sandbox: ${task.sandbox_mode || 'workspace-write'}`;
-    sandboxEl.className = `ah-detail-sandbox ${task.sandbox_mode === 'danger-full-access' ? 'ah-detail-sandbox--danger' : ''}`;
-  }
-
-  // Re-render the timeline (surgical replace of just the timeline section)
-  const events = task.events || [];
-  const timelineContainer = document.querySelector('.ah-timeline');
-  if (timelineContainer) {
-    let pendingActions = [];
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
-      if (e.event_type === 'message' && e.metadata_json) {
-        try {
-          const meta = JSON.parse(e.metadata_json);
-          if (meta.actions_pending && meta.actions && meta.actions.length) {
-            pendingActions = meta.actions;
-          }
-        } catch (_) {}
-        break;
-      }
-    }
-
-    const timelineHtml = events.map(e => {
-      const actorClass = _actorClass(e.actor);
-      const typeLabel = _eventTypeLabel(e.event_type);
-      let metaBlock = '';
-      if (e.metadata_json) {
-        try {
-          const meta = JSON.parse(e.metadata_json);
-          if (meta.actions && meta.actions.length) {
-            const actionList = meta.actions.map(a =>
-              `<div class="ah-action-chip ah-action-chip--${a.type}">${_esc(a.label || a.type)}</div>`
-            ).join('');
-            const pendingBadge = meta.actions_pending
-              ? '<span class="ah-action-pending">pending approval</span>'
-              : '<span class="ah-action-done">executed</span>';
-            metaBlock = `<div class="ah-event-actions">${pendingBadge}${actionList}</div>`;
-          }
-        } catch (_) {}
-      }
-      return `
-        <div class="ah-event ah-event--${e.event_type}">
-          <div class="ah-event-header">
-            <span class="ah-event-actor ah-actor--${actorClass}">${_esc(e.actor)}</span>
-            <span class="ah-event-type-label">${typeLabel}</span>
-            <span class="ah-event-time">${_formatTime(e.created_at)}</span>
-          </div>
-          ${e.summary ? `<div class="ah-event-summary">${_esc(e.summary)}</div>` : ''}
-          ${e.content ? `<div class="ah-event-content">${_esc(e.content)}</div>` : ''}
-          ${metaBlock}
-        </div>
-      `;
-    }).reverse().join('');
-
-    timelineContainer.innerHTML = `
-      <h4 class="ah-timeline-title">Timeline</h4>
-      ${timelineHtml || '<div class="ah-empty">No events yet.</div>'}
-    `;
-  }
-
-  // Update approval callout if status changed
-  const calloutContainer = document.querySelector('.ah-approval-callout');
-  const hasApproval = task.status === 'waiting_for_approval';
-  if (hasApproval && !calloutContainer) {
-    // Need to add approval callout — do a full re-render in this case (rare)
-    _renderTaskDetail(task);
-  } else if (!hasApproval && calloutContainer) {
-    calloutContainer.remove();
-  }
-
-  // Start / stop the running timer
-  if (task.status === 'running' && task.locked_at) {
-    _runningSince = task.locked_at;
-    _startTimer();
-  } else {
-    _stopTimer();
-  }
-}
-
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 async function _deleteTask(taskId) {
   await _apiCall('DELETE', `/api/agent-hub/tasks/${taskId}`);
-  if (_selectedTaskId === taskId) { _selectedTaskId = null; _renderEmptyDetail(); }
+  if (_selectedTaskId === taskId) { _selectedTaskId = null; _detailTimerSince = null; _renderEmptyDetail(); }
   _fetchAndRender();
 }
 
-// ── Running timer ────────────────────────────────────────────────────────────
+// ── Timers (split: list-level always on, detail per-selection) ────────────────
 
-function _startTimer() {
-  if (_timerInterval) return;  // already ticking
-  _timerInterval = setInterval(_tickAllTimers, 1000);
-  _tickAllTimers();  // show immediately
+function _startListTimer() {
+  if (_listTimerInterval) return;
+  _listTimerInterval = setInterval(_tickAllListTimers, 1000);
+  _tickAllListTimers();
 }
 
-function _stopTimer() {
-  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
-  _runningSince = null;
-  const el = document.getElementById('ah-running-timer');
-  if (el) el.style.display = 'none';
+function _stopListTimer() {
+  if (_listTimerInterval) { clearInterval(_listTimerInterval); _listTimerInterval = null; }
 }
 
-function _tickAllTimers() {
-  // Detail timer
-  const detailEl = document.getElementById('ah-running-timer');
-  if (detailEl && _runningSince) {
-    try {
-      const elapsed = Math.floor((Date.now() - new Date(_runningSince).getTime()) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      detailEl.textContent = `${mins}:${String(secs).padStart(2, '0')}`;
-      detailEl.style.display = '';
-      detailEl.classList.toggle('ah-timer-pulse', elapsed > 0);
-    } catch (_) { detailEl.style.display = 'none'; }
-  } else if (detailEl) {
-    detailEl.style.display = 'none';
-  }
-
-  // List timers — update every .ah-task-item with data-locked-at
+function _tickAllListTimers() {
+  // Update every .ah-task-item[data-locked-at] row timer
   document.querySelectorAll('.ah-task-item[data-locked-at]').forEach(item => {
     const timerEl = item.querySelector('.ah-task-timer');
     if (!timerEl) return;
@@ -806,12 +819,11 @@ function _tickAllTimers() {
       const started = new Date(item.dataset.lockedAt);
       const doneAt = item.dataset.doneAt ? new Date(item.dataset.doneAt) : null;
       const end = (status !== 'running' && doneAt) ? doneAt : Date.now();
-      const elapsed = Math.floor((end - started.getTime()) / 1000);
+      const elapsed = Math.max(0, Math.floor((end - started.getTime()) / 1000));
       const mins = Math.floor(elapsed / 60);
       const secs = elapsed % 60;
       timerEl.textContent = `${mins}:${String(secs).padStart(2, '0')}`;
       timerEl.classList.remove('ah-task-timer--hidden');
-      // Color by final status
       timerEl.classList.remove('ah-task-timer--done', 'ah-task-timer--blocked', 'ah-task-timer--cancelled', 'ah-task-timer--running', 'ah-task-timer--waiting');
       if (status === 'running') {
         timerEl.classList.add('ah-task-timer--running');
@@ -828,6 +840,37 @@ function _tickAllTimers() {
       timerEl.classList.add('ah-task-timer--hidden');
     }
   });
+
+  // Detail timer
+  _tickDetailTimer();
+}
+
+function _updateDetailTimerState(task) {
+  if (task && task.status === 'running' && task.locked_at) {
+    _detailTimerSince = task.locked_at;
+  } else {
+    _detailTimerSince = null;
+  }
+  _tickDetailTimer();
+}
+
+function _tickDetailTimer() {
+  const el = document.getElementById('ah-running-timer');
+  if (!el) return;
+  if (_detailTimerSince) {
+    try {
+      const elapsed = Math.max(0, Math.floor((Date.now() - new Date(_detailTimerSince).getTime()) / 1000));
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      el.textContent = `${mins}:${String(secs).padStart(2, '0')}`;
+      el.style.display = '';
+      el.classList.toggle('ah-timer-pulse', elapsed > 0);
+    } catch (_) {
+      el.style.display = 'none';
+    }
+  } else {
+    el.style.display = 'none';
+  }
 }
 
 // ── Badge ────────────────────────────────────────────────────────────────────
@@ -851,8 +894,9 @@ function _updateBadge(tasks) {
 function _teardown() {
   _open = false;
   _selectedTaskId = null;
-  _stopPolling();
-  _stopTimer();
+  _detailTimerSince = null;
+  _stopSSE();
+  _stopListTimer();
   const modal = document.getElementById(MODAL_ID);
   if (modal) modal.style.display = 'none';
 }
@@ -912,7 +956,6 @@ function _wireSplitter(modal) {
   const left = modal.querySelector('#ah-task-list');
   if (!splitter || !left) return;
 
-  // Restore saved position
   try {
     const saved = localStorage.getItem(SPLITTER_KEY);
     if (saved) left.style.width = saved + 'px';
@@ -937,7 +980,6 @@ function _wireSplitter(modal) {
     const dx = e.clientX - startX;
     let newW = startW + dx;
     const totalW = left.parentElement.offsetWidth;
-    // Clamp
     if (newW < SPLITTER_MIN_LEFT) newW = SPLITTER_MIN_LEFT;
     if (totalW - newW < SPLITTER_MIN_RIGHT) newW = totalW - SPLITTER_MIN_RIGHT;
     left.style.width = newW + 'px';
