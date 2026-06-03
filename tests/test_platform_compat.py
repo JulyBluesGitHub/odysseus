@@ -35,3 +35,18 @@ def test_find_bash_checks_local_app_data_git_install(monkeypatch):
     monkeypatch.setattr(platform_compat.os.path, "exists", lambda path: path == expected)
 
     assert platform_compat.find_bash() == expected
+
+
+def test_find_bash_skips_windowsapps_alias_for_git_bash(monkeypatch):
+    _reset_bash_cache(monkeypatch)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        platform_compat.shutil,
+        "which",
+        lambda name: r"C:\Users\alice\AppData\Local\Microsoft\WindowsApps\bash.exe" if name == "bash" else None,
+    )
+
+    expected = r"C:\Program Files\Git\bin\bash.exe"
+    monkeypatch.setattr(platform_compat.os.path, "exists", lambda path: path == expected)
+
+    assert platform_compat.find_bash() == expected

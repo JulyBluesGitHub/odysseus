@@ -905,6 +905,19 @@ function initializeEventListeners() {
     });
   }
 
+  // Agent Hub tool button
+  const toolAgentHubBtn = el('tool-agent-hub-btn');
+  if (toolAgentHubBtn) {
+    toolAgentHubBtn.addEventListener('click', async () => {
+      const agentHubModule = await import('./js/agentHub.js');
+      const Modals = await import('./js/modalManager.js');
+      if (!Modals.toggle('agent-hub-modal')) {
+        if (agentHubModule.isAgentHubOpen()) agentHubModule.closeAgentHub();
+        else agentHubModule.openAgentHub();
+      }
+    });
+  }
+
   // Notes tool button
   const toolNotesBtn = el('tool-notes-btn');
   if (toolNotesBtn) {

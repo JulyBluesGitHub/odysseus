@@ -554,6 +554,69 @@ class ScheduledTask(TimestampMixin, Base):
     )
 
 
+class AgentTask(TimestampMixin, Base):
+    """An Agent Hub task — the unit of work in the multi-agent cockpit.
+
+    Tasks move through a small status machine (draft → queued → running →
+    waiting_for_approval | blocked | done | cancelled) with a separate
+    ``phase`` field for workflow semantics (planning, implementation, etc.).
+    The coordinator claims tasks atomically via ``locked_by`` / ``locked_at``
+    so at most one agent works on a task at a time.
+    """
+    __tablename__ = "agent_tasks"
+
+    id                = Column(String, primary_key=True, index=True)
+    owner             = Column(String, nullable=True, index=True)
+    title             = Column(String, nullable=False, default="Untitled Task")
+    objective         = Column(Text, nullable=True)
+    status            = Column(String, default="draft", index=True)
+    # draft | queued | running | waiting_for_approval | blocked | done | cancelled
+    phase             = Column(String, nullable=True)
+    # planning | review | implementation | verification | handoff
+    current_owner     = Column(String, nullable=True)
+    # user | hermes | codex | cursor
+    approval_required = Column(Boolean, default=False)
+    locked_by         = Column(String, nullable=True)
+    locked_at         = Column(DateTime, nullable=True)
+    attempt_count     = Column(Integer, default=0)
+    last_error        = Column(Text, nullable=True)
+    session_id        = Column(String, nullable=True)
+    chain_task_id     = Column(String, nullable=True)
+    # ID of the next task to auto-create when this one completes
+    sandbox_mode      = Column(String, nullable=False, default="workspace-write")
+    # read-only | workspace-write | danger-full-access
+
+    __table_args__ = (
+        Index('ix_agent_tasks_status_owner', 'status', 'owner'),
+    )
+
+
+class AgentEvent(TimestampMixin, Base):
+    """A single event in an Agent Hub task's timeline — a message, status
+    change, approval action, error, or lock acquisition. Every event is
+    attributed to an actor (user, agent, or coordinator).
+    """
+    __tablename__ = "agent_events"
+
+    id            = Column(String, primary_key=True, index=True)
+    task_id       = Column(String, ForeignKey("agent_tasks.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    actor         = Column(String, nullable=False)
+    # "user" | "hermes" | "codex" | "coordinator"
+    event_type    = Column(String, nullable=False)
+    # "message" | "status_change" | "approval" | "error" | "lock"
+    summary       = Column(Text, nullable=True)
+    content       = Column(Text, nullable=True)           # full adapter output / message body
+    metadata_json = Column(Text, nullable=True)           # JSON blob for structured adapter data
+
+    task = relationship("AgentTask", backref=backref("events", cascade="all, delete-orphan",
+                         order_by="AgentEvent.created_at"))
+
+    __table_args__ = (
+        Index('ix_agent_events_task_created', 'task_id', 'created_at'),
+    )
+
+
 class EditorDraft(TimestampMixin, Base):
     """Persisted in-progress gallery-editor session — layered project state
     that the user can close and reopen later. Stores the full layer payload
@@ -1563,6 +1626,54 @@ def init_db():
     _migrate_encrypt_email_passwords()
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
+    _migrate_add_agent_task_chain_column()
+    _migrate_add_agent_task_sandbox_mode()
+
+
+def _migrate_add_agent_task_chain_column():
+    """Add chain_task_id column to agent_tasks if it doesn't exist."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(agent_tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "chain_task_id" not in columns:
+            conn.execute("ALTER TABLE agent_tasks ADD COLUMN chain_task_id TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added chain_task_id column to agent_tasks")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.chain_task_id migration failed: {e}")
+
+
+def _migrate_add_agent_task_sandbox_mode():
+    """Add sandbox_mode column to agent_tasks (default 'workspace-write').
+    Existing rows get the default value, which is conservative and safe."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(agent_tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "sandbox_mode" not in columns:
+            conn.execute(
+                "ALTER TABLE agent_tasks ADD COLUMN sandbox_mode TEXT "
+                "NOT NULL DEFAULT 'workspace-write'"
+            )
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: added sandbox_mode column to agent_tasks"
+            )
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"agent_tasks.sandbox_mode migration failed: {e}"
+        )
 
 
 def _migrate_add_email_smtp_security():

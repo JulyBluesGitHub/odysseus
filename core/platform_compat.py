@@ -151,6 +151,13 @@ _WINDOWS_BASH_RELATIVE_PATHS = (
 )
 
 
+def _is_windows_app_execution_alias(path: str | None) -> bool:
+    if not path or not IS_WINDOWS:
+        return False
+    normalized = ntpath.normcase(ntpath.normpath(path))
+    return normalized.endswith(ntpath.normcase(r"\Microsoft\WindowsApps\bash.exe"))
+
+
 def _windows_bash_fallbacks() -> List[str]:
     roots: List[str] = []
     for env_name in _WINDOWS_BASH_ROOT_ENV_VARS:
@@ -184,6 +191,8 @@ def find_bash() -> Optional[str]:
         return _BASH_CACHE
     _BASH_PROBED = True
     found = which_tool("bash")
+    if _is_windows_app_execution_alias(found):
+        found = None
     if not found and IS_WINDOWS:
         for cand in _windows_bash_fallbacks():
             if os.path.exists(cand):

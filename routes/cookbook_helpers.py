@@ -163,6 +163,34 @@ def _pip_install_no_cache(cmd: str) -> str:
     return cmd.replace("pip install", "pip install --no-cache-dir", 1)
 
 
+def _local_windows_python3_shim() -> str:
+    """Bash snippet for Windows venvs that only expose python.exe/pip.exe.
+
+    Cookbook's POSIX runners call ``python3``/``pip3`` in several places. Git
+    Bash on Windows often resolves those names to Microsoft Store aliases, while
+    the active Odysseus venv only has ``python.exe`` and ``pip.exe``. Functions
+    take precedence over PATH lookups and keep the rest of the runner portable.
+    """
+    return "python3() { python \"$@\"; }\npip3() { python -m pip \"$@\"; }"
+
+
+def _local_windows_short_temp_export() -> str:
+    """Use a short temp path for local Windows pip/build jobs.
+
+    Some ML packages vendor deeply nested source trees. Under the default
+    ``%LOCALAPPDATA%\Temp\pip-install-*`` path, extraction/build can exceed
+    Windows path limits before pip can even report a useful package error.
+    """
+    return (
+        'ODYSSEUS_PIP_TMP_WIN="C:\\\\odysseus-pip-tmp"\n'
+        'ODYSSEUS_PIP_TMP_POSIX="$(cygpath -u "$ODYSSEUS_PIP_TMP_WIN" 2>/dev/null || printf "%s" "/c/odysseus-pip-tmp")"\n'
+        'mkdir -p "$ODYSSEUS_PIP_TMP_POSIX" 2>/dev/null || true\n'
+        'export TMP="$ODYSSEUS_PIP_TMP_WIN"\n'
+        'export TEMP="$ODYSSEUS_PIP_TMP_WIN"\n'
+        'export TMPDIR="$ODYSSEUS_PIP_TMP_POSIX"'
+    )
+
+
 def _pip_install_attempt(pip_cmd: str) -> str:
     """Wrap a single pip install command so its exit status survives the
     fallback chain and its stderr is visible in the tmux log on failure.

@@ -12,7 +12,7 @@ const _defaultKeybinds = {
   // Open-tool shortcuts (Calendar bound by default; rest unbound).
   open_calendar: 'ctrl+alt+c', open_compare: '', open_cookbook: '',
   open_research: '', open_gallery: '', open_library: '', open_memory: '',
-  open_notes: '', open_tasks: '', open_theme: '',
+  open_notes: '', open_tasks: '', open_theme: '', open_agent_hub: 'ctrl+shift+h',
 };
 
 export function _matchesCombo(e, combo, isMac = IS_MAC) {
@@ -107,6 +107,7 @@ export function initKeyboardShortcuts(modules) {
     'cookbook-modal':         'tool-cookbook-btn',
     'compare-model-overlay':  'tool-compare-btn',
     'calendar-modal':         'tool-calendar-btn',
+    'agent-hub-modal':        'tool-agent-hub-btn',
     'email-lib-modal':        'email-section-title',
   };
   let _lastWindow = 'settings-modal';
@@ -273,6 +274,7 @@ export function initKeyboardShortcuts(modules) {
       open_notes:    'tool-notes-btn',
       open_tasks:    'tool-tasks-btn',
       open_theme:    'tool-theme-btn',
+      open_agent_hub:'tool-agent-hub-btn',
     };
     for (const action in _toolBtns) {
       if (_matchesCombo(e, kb[action])) {

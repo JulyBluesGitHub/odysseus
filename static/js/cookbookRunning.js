@@ -2428,7 +2428,13 @@ async function _reconnectTask(el, task) {
           _showCookbookNotif(true);
         } else {
           const downloadLooksSuccessful = !lastOutput.includes('DOWNLOAD_FAILED')
-            && (lastOutput.includes('DONE') || lastOutput.includes('100%') || lastOutput.includes('/snapshots/') || lastOutput.includes('Download complete') || lastOutput.includes('DOWNLOAD_OK'));
+            && (lastOutput.includes('DONE')
+              || lastOutput.includes('100%')
+              || lastOutput.includes('/snapshots/')
+              || lastOutput.includes('Download complete')
+              || lastOutput.includes('DOWNLOAD_OK')
+              || (/=== Process exited with code 0 ===/i.test(lastOutput) && task.payload?._dep)
+              || (/Successfully installed/i.test(lastOutput) && task.payload?._dep));
           const serveLooksReady = task.type === 'serve' && _serveOutputLooksReady({ ...task, output: lastOutput });
           const looksSuccessful = task.type === 'download' ? downloadLooksSuccessful : serveLooksReady;
           if (!lastOutput.trim() || !looksSuccessful) {

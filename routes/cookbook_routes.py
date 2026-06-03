@@ -39,6 +39,7 @@ from routes.cookbook_helpers import (
     _safe_env_prefix, _local_tooling_path_export, _append_serve_preflight_exit_lines,
     _append_serve_exit_code_lines, _append_llama_cpp_linux_accel_build_lines, _cached_model_scan_script,
     _ollama_bind_from_cmd, _pip_install_fallback_chain, _pip_install_no_cache, _venv_safe_local_pip_install_cmd,
+    _local_windows_python3_shim, _local_windows_short_temp_export,
     ModelDownloadRequest, ServeRequest,
 )
 
@@ -441,11 +442,13 @@ def setup_cookbook_routes() -> APIRouter:
             lines.append(f"export HF_TOKEN='{_bash_squote(req.hf_token)}'")
         # Ensure pip-user scripts (e.g. hf CLI installed via --user) are on PATH
         lines.append('export PATH="$HOME/.local/bin:$PATH"')
-        # When Odysseus runs from a venv (e.g. native macOS install), put its bin
-        # on PATH so the tmux shell finds the bundled `hf`/`python3` without an
-        # activated venv. Local bash runs only — meaningless over SSH/Windows.
-        if not req.remote_host and req.platform != "windows":
+        # When Odysseus runs from a venv, put its bin on PATH so the background
+        # shell finds the bundled `hf`/`python` without an activated venv.
+        if not req.remote_host:
             lines.append(_local_tooling_path_export(sys.executable))
+            if IS_WINDOWS:
+                lines.append(_local_windows_python3_shim())
+                lines.append(_local_windows_short_temp_export())
         # Best-effort install hf CLI (always). hf_transfer (Rust parallel downloader)
         # is fast but flaky on large files — it tends to crash near the end at high
         # throughput. Retries set disable_hf_transfer to fall back to the plain,
@@ -1010,6 +1013,9 @@ def setup_cookbook_routes() -> APIRouter:
             # shell resolves the bundled python3/hf, mirroring the download flow.
             if not remote:
                 runner_lines.append(_local_tooling_path_export(sys.executable))
+                if local_windows:
+                    runner_lines.append(_local_windows_python3_shim())
+                    runner_lines.append(_local_windows_short_temp_export())
             runner_lines.append("export FLASHINFER_DISABLE_VERSION_CHECK=1")
             if req.hf_token:
                 runner_lines.append(f"export HF_TOKEN='{_bash_squote(req.hf_token)}'")
@@ -1975,7 +1981,7 @@ def setup_cookbook_routes() -> APIRouter:
                 "inc=os.path.isdir(blobs) and any(x.endswith('.incomplete') for x in os.listdir(blobs));"
                 "sys.exit(0 if ok and not inc else 1)"
             )
-            cmd = ["python3", "-c", py, repo_id]
+            cmd = [sys.executable if IS_WINDOWS and not remote_host else "python3", "-c", py, repo_id]
             try:
                 if remote_host:
                     ssh_base = ["ssh"]

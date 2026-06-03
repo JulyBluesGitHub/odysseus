@@ -625,6 +625,11 @@ app.include_router(setup_task_routes(task_scheduler))
 from routes.assistant_routes import setup_assistant_routes
 app.include_router(setup_assistant_routes(task_scheduler))
 
+# Agent Hub — multi-agent cockpit (task CRUD, events, assign, approve, coordinator)
+from routes.agent_hub_routes import setup_agent_hub_routes
+app.include_router(setup_agent_hub_routes())
+logger.info("Agent Hub routes initialized")
+
 # Calendar (CalDAV)
 from routes.calendar_routes import setup_calendar_routes
 app.include_router(setup_calendar_routes())
@@ -855,6 +860,18 @@ async def _startup_event():
         _startup_tasks.append(start_bg_monitor())
     except Exception as _e:
         logger.warning("Failed to start background-job monitor: %s", _e)
+    # Agent Hub coordinator — polls for queued tasks and dispatches to adapters.
+    try:
+        from src.agent_coordinator import start as _start_coordinator, register_adapter
+        from src.adapters.mock import MockAdapter
+        from src.adapters.hermes import HermesAdapter
+        from src.adapters.codex import CodexAdapter
+        register_adapter("mock", MockAdapter())
+        register_adapter("hermes", HermesAdapter())
+        register_adapter("codex", CodexAdapter())
+        _startup_tasks.append(asyncio.create_task(_start_coordinator()))
+    except Exception as _e:
+        logger.warning("Failed to start Agent Hub coordinator: %s", _e)
     # MCP servers can be slow or blocked by local tooling. Connect them after
     # the web server is accepting traffic instead of delaying the whole UI.
     async def _startup_mcp_connections():
@@ -1063,6 +1080,12 @@ async def _shutdown_event():
         await webhook_manager.close()
     except Exception as e:
         logger.warning(f"Webhook manager shutdown error: {e}")
+    # Stop Agent Hub coordinator
+    try:
+        from src.agent_coordinator import stop as _stop_coordinator
+        await _stop_coordinator()
+    except Exception:
+        pass
     # Disconnect all MCP servers
     try:
         await mcp_manager.disconnect_all()

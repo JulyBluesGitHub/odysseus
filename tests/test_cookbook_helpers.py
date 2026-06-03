@@ -12,6 +12,8 @@ from routes.cookbook_helpers import (
     _append_serve_preflight_exit_lines,
     _llama_cpp_rebuild_cmd,
     _local_tooling_path_export,
+    _local_windows_python3_shim,
+    _local_windows_short_temp_export,
     _pip_install_attempt,
     _pip_install_fallback_chain,
     _ollama_bind_from_cmd,
@@ -87,6 +89,22 @@ def test_local_tooling_path_export_preserves_spaces_and_expands_path():
     line = _local_tooling_path_export("/Users/John Smith/.venv/bin/python3")
     assert line == 'export PATH="/Users/John Smith/.venv/bin:$PATH"'
     assert line.endswith(':$PATH"')  # $PATH stays expandable in double quotes
+
+
+def test_local_windows_python3_shim_maps_to_active_python():
+    shim = _local_windows_python3_shim()
+
+    assert 'python3() { python "$@"; }' in shim
+    assert 'pip3() { python -m pip "$@"; }' in shim
+
+
+def test_local_windows_short_temp_export_sets_pip_temp_paths():
+    snippet = _local_windows_short_temp_export()
+
+    assert 'C:\\\\odysseus-pip-tmp' in snippet
+    assert 'export TMP="$ODYSSEUS_PIP_TMP_WIN"' in snippet
+    assert 'export TEMP="$ODYSSEUS_PIP_TMP_WIN"' in snippet
+    assert 'export TMPDIR="$ODYSSEUS_PIP_TMP_POSIX"' in snippet
 
 
 def test_pip_install_fallback_chain_prefers_venv_safe_install():
