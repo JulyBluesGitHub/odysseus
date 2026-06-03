@@ -116,6 +116,64 @@ def _get_unmet_dependencies(task, db) -> list:
     return unmet
 
 
+def _execute_create_task_actions(db, parent_task, actions: list) -> int:
+    """Execute any create_task actions from an adapter result.
+
+    Creates subtasks in the DB, records timeline events on both parent and
+    child, and returns the number of tasks created.
+    """
+    import uuid as _uuid
+    created = 0
+    for action in actions:
+        if action.type != "create_task":
+            continue
+        if not action.role or action.role not in (VALID_ROLES if False else VALID_ROLES):  # always True
+            _record_event(
+                db, parent_task.id, "coordinator", "error",
+                summary=f"Skipped create_task: invalid or missing role '{action.role}'",
+            )
+            continue
+
+        child_id = str(_uuid.uuid4())
+        child = AgentTask(
+            id=child_id,
+            owner=parent_task.owner,
+            title=action.task_title or f"Subtask of {parent_task.title[:40]}",
+            objective=action.objective or "",
+            status="queued",
+            role=action.role,
+            current_owner=None,  # resolved at claim time via role binding
+            depends_on=list(action.depends_on) if action.depends_on else None,
+            created_by_task_id=parent_task.id,
+            sandbox_mode=parent_task.sandbox_mode,
+            session_id=parent_task.session_id,
+        )
+        db.add(child)
+
+        # Timeline: parent
+        _record_event(
+            db, parent_task.id, "coordinator", "status_change",
+            summary=f"Created subtask '{child.title}' for role {child.role}",
+        )
+        # Timeline: child
+        _record_event(
+            db, child_id, "coordinator", "status_change",
+            summary=(
+                f"Created by task '{parent_task.title}'"
+                + (f" (waiting on {len(action.depends_on)} dependencies)" if action.depends_on else "")
+            ),
+        )
+        created += 1
+        logger.info(
+            "Agent Hub: subtask '%s' (role=%s) created by task %s",
+            child.title, child.role, parent_task.id,
+        )
+
+    if created:
+        db.commit()
+    return created
+
+
 # ── Coordinator state ─────────────────────────────────────────────────────────
 
 _coordinator_task: asyncio.Task | None = None
@@ -351,6 +409,8 @@ async def _tick():
                 content=result.content,
                 metadata_json=_safe_json_dump(_enrich_metadata(result)),
             )
+            # Process create_task actions immediately (no approval needed)
+            _execute_create_task_actions(db2, task, result.actions)
             # Apply proposed transitions
             if result.needs_approval:
                 # Approval takes precedence over any status proposal.

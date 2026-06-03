@@ -46,6 +46,13 @@ If you propose actions, use [STATUS: waiting_for_approval] and add a JSON [ACTIO
 [ACTIONS]
 {"type": "file_write", "label": "Create main.py", "path": "src/main.py", "content": "print('hello')"}
 {"type": "shell", "label": "Run the script", "command": "python src/main.py"}
+{"type": "create_task", "label": "Spawn implementation", "role": "implementer", "title": "Implement X", "objective": "...", "depends_on": ["parent-task-id"]}
+
+create_task action fields:
+- role (required): diagnoser, implementer, or verifier
+- title (required): short task title
+- objective (optional): detailed instructions for the child task
+- depends_on (optional): list of task IDs the child must wait for
 
 Rules for actions:
 - file_write: path is relative to the project root. Include the full file content.
@@ -200,9 +207,13 @@ def _extract_actions(text: str) -> list:
                 path=obj.get("path", ""),
                 content=obj.get("content", ""),
                 workdir=obj.get("workdir"),
+                role=obj.get("role", ""),
+                task_title=obj.get("title", ""),
+                objective=obj.get("objective", ""),
+                depends_on=obj.get("depends_on", []),
             )
             # Only include valid action types
-            if action.type in ("shell", "file_write", "file_read"):
+            if action.type in ("shell", "file_write", "file_read", "create_task"):
                 actions.append(action)
         except (json.JSONDecodeError, TypeError, KeyError):
             continue

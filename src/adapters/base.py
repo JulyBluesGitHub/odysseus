@@ -30,12 +30,13 @@ class AgentAction:
     """A single executable action proposed by an adapter.
 
     Supported types:
-        ``shell``      — run a shell command
-        ``file_write`` — write content to a file
-        ``file_read``  — read a file and return as event content
+        ``shell``       — run a shell command
+        ``file_write``  — write content to a file
+        ``file_read``   — read a file and return as event content
+        ``create_task`` — spawn a subtask (requires role, title fields)
     """
 
-    type: str  # "shell" | "file_write" | "file_read"
+    type: str  # "shell" | "file_write" | "file_read" | "create_task"
     label: str = ""  # human-readable description for the timeline
     # shell
     command: str = ""
@@ -45,6 +46,11 @@ class AgentAction:
     content: str = ""
     # file_read
     # (uses path above)
+    # create_task
+    role: str = ""        # diagnoser | implementer | verifier
+    task_title: str = ""  # title for the spawned task
+    objective: str = ""   # objective for the spawned task
+    depends_on: list = field(default_factory=list)  # list of task IDs to wait on
 
 
 @dataclass

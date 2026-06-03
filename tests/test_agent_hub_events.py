@@ -452,13 +452,56 @@ class TestRoleDispatch:
 
     def test_role_with_binding_dispatches(self, client):
         """Task with a valid role and binding dispatches normally (route-level)."""
-        # Just verify the task can be created and listed with a role
         r = client.post("/api/agent-hub/tasks", json={
             "title": "Has binding", "status": "queued", "role": "verifier",
         })
         assert r.status_code == 201
         assert r.json()["role"] == "verifier"
-        # Task exists in the list
         r2 = client.get("/api/agent-hub/tasks")
         tasks = r2.json()["tasks"]
         assert any(t["role"] == "verifier" for t in tasks)
+
+
+class TestCreateTaskAction:
+    """Tests for the create_task action type."""
+
+    def test_create_task_action_parsed_from_json(self):
+        """create_task action JSON is parsed correctly."""
+        from src.adapters.hermes import _extract_actions
+        text = """
+Some response text.
+[ACTIONS]
+{"type": "create_task", "label": "Spawn fix", "role": "implementer", "title": "Fix bug", "objective": "Fix the login bug"}
+"""
+        actions = _extract_actions(text)
+        assert len(actions) == 1
+        a = actions[0]
+        assert a.type == "create_task"
+        assert a.role == "implementer"
+        assert a.task_title == "Fix bug"
+        assert a.objective == "Fix the login bug"
+
+    def test_create_task_action_requires_role(self):
+        """create_task with no role is skipped."""
+        from src.adapters.hermes import _extract_actions
+        text = """
+[ACTIONS]
+{"type": "create_task", "title": "No role task"}
+"""
+        actions = _extract_actions(text)
+        assert len(actions) == 1
+        assert actions[0].role == ""
+
+    def test_mixed_actions_parsed(self):
+        """create_task mixed with shell actions is parsed correctly."""
+        from src.adapters.hermes import _extract_actions
+        text = """
+[ACTIONS]
+{"type": "file_write", "label": "Write code", "path": "fix.py", "content": "print('ok')"}
+{"type": "create_task", "role": "verifier", "title": "Verify fix"}
+"""
+        actions = _extract_actions(text)
+        assert len(actions) == 2
+        types = {a.type for a in actions}
+        assert "file_write" in types
+        assert "create_task" in types
