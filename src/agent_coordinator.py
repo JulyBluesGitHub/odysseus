@@ -39,6 +39,31 @@ POLL_INTERVAL = float(os.getenv("AGENT_HUB_POLL_INTERVAL", "5"))
 MAX_ATTEMPTS = 3
 """Max dispatch attempts before a task is marked blocked."""
 
+# ── Concurrency caps ──────────────────────────────────────────────────────────
+
+CAPS = {
+    "global": int(os.getenv("AGENT_HUB_CAP_GLOBAL", "3")),
+    "adapter": {
+        k: int(v) for k, v in
+        (item.split(":") for item in os.getenv(
+            "AGENT_HUB_CAP_ADAPTER", "codex:1,cursor:1,hermes:2"
+        ).split(","))
+    },
+    "role": {
+        k: int(v) for k, v in
+        (item.split(":") for item in os.getenv(
+            "AGENT_HUB_CAP_ROLE", "implementer:1,verifier:2"
+        ).split(","))
+    },
+}
+"""Concurrency limits. Global cap applies first, then per-adapter and per-role
+caps are checked independently. A task must satisfy all applicable caps."""
+
+# Running counts — incremented when a task is claimed, decremented on completion
+_running_by_adapter: dict[str, int] = {}
+_running_by_role: dict[str, int] = {}
+_running_total = 0
+
 
 def _publish_task(task_id: str) -> None:
     """Re-fetch a task from DB and publish a task_updated event to its owner."""
@@ -114,6 +139,17 @@ def _get_unmet_dependencies(task, db) -> list:
         if not dep_task or dep_task.status != "done":
             unmet.append(dep_id)
     return unmet
+
+
+def _block_task(db, task, reason: str):
+    """Mark a task as blocked with an error event and commit."""
+    task.status = "blocked"
+    task.last_error = reason
+    _record_event(
+        db, task.id, "coordinator", "error",
+        summary=reason,
+    )
+    db.flush()  # keep in current transaction — caller commits
 
 
 def _execute_create_task_actions(db, parent_task, actions: list) -> int:
@@ -238,7 +274,45 @@ def get_status() -> dict:
         "tasks_processed": _tasks_processed,
         "adapters": sorted(_adapter_registry.keys()),
         "poll_interval": POLL_INTERVAL,
+        "caps": CAPS,
+        "running_counts": {
+            "total": _running_total,
+            "by_adapter": dict(_running_by_adapter),
+            "by_role": dict(_running_by_role),
+        },
     }
+
+
+# ── Cap helpers ────────────────────────────────────────────────────────────────
+
+def _inc_running(adapter: str, role: str | None):
+    global _running_total
+    _running_total += 1
+    _running_by_adapter[adapter] = _running_by_adapter.get(adapter, 0) + 1
+    if role:
+        _running_by_role[role] = _running_by_role.get(role, 0) + 1
+
+
+def _dec_running(adapter: str, role: str | None):
+    global _running_total
+    _running_total = max(0, _running_total - 1)
+    _running_by_adapter[adapter] = max(0, _running_by_adapter.get(adapter, 0) - 1)
+    if role:
+        _running_by_role[role] = max(0, _running_by_role.get(role, 0) - 1)
+
+
+def _caps_allow(adapter: str, role: str | None) -> bool:
+    """Check if dispatching a task to this adapter/role would exceed any cap."""
+    if _running_total >= CAPS["global"]:
+        return False
+    cap_adapter = CAPS["adapter"].get(adapter)
+    if cap_adapter is not None and _running_by_adapter.get(adapter, 0) >= cap_adapter:
+        return False
+    if role:
+        cap_role = CAPS["role"].get(role)
+        if cap_role is not None and _running_by_role.get(role, 0) >= cap_role:
+            return False
+    return True
 
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
@@ -270,21 +344,18 @@ async def _coordinator_loop():
 
 
 async def _tick():
-    """Single coordinator tick — claim one task and dispatch it.
+    """Coordinator tick — claim and dispatch all eligible queued tasks.
 
-    Tasks can target a role (diagnoser/implementer/verifier) or specify an
-    adapter directly via current_owner. For role-based tasks, the coordinator
-    resolves role → adapter via the RoleBinding table at claim time and records
-    the resolution in the timeline.
+    Resolves roles, checks dependencies, and enforces concurrency caps
+    (global, per-adapter, per-role). Eligible tasks are dispatched in
+    parallel via asyncio.gather.
     """
     global _tasks_processed
 
     db = SessionLocal()
     try:
-        # Find the oldest queued, unlocked task that is either:
-        # - directly assigned to a registered adapter, OR
-        # - assigned to a role (will be resolved below)
-        task = (
+        # Find ALL queued, unlocked tasks sorted by creation time
+        candidates = (
             db.query(AgentTask)
             .filter(
                 AgentTask.status == "queued",
@@ -295,168 +366,155 @@ async def _tick():
                 ),
             )
             .order_by(AgentTask.created_at)
-            .first()
+            .limit(CAPS["global"] + 5)  # fetch a few more than global cap
+            .all()
         )
-        if not task:
+        if not candidates:
             return
 
-        # Resolve role → adapter if needed
-        if task.role:
-            if task.role not in VALID_ROLES:
-                task.status = "blocked"
-                task.last_error = f"Invalid role: {task.role}"
-                _record_event(
-                    db, task.id, "coordinator", "error",
-                    summary=f"Invalid role '{task.role}' — valid roles: {', '.join(sorted(VALID_ROLES))}",
-                )
-                db.commit()
-                _publish_task(task.id)
-                return
+        # Filter: resolve roles, check deps, check caps
+        eligible = []
+        for task in candidates:
+            # Resolve role
+            if task.role:
+                if task.role not in VALID_ROLES:
+                    _block_task(db, task, f"Invalid role: {task.role}")
+                    continue
+                resolved = _resolve_role(task.role, task.owner)
+                if not resolved:
+                    _block_task(db, task, f"No adapter bound to role '{task.role}'")
+                    continue
+                if getattr(task, "current_owner", None) != resolved:
+                    old_owner = task.current_owner
+                    task.current_owner = resolved
+                    _record_event(
+                        db, task.id, "coordinator", "status_change",
+                        summary=f"Resolved role {task.role} to adapter {resolved}"
+                        + (f" (was {old_owner})" if old_owner and old_owner != resolved else ""),
+                    )
 
-            resolved = _resolve_role(task.role, task.owner)
-            if not resolved:
-                task.status = "blocked"
-                task.last_error = f"No adapter bound to role '{task.role}'"
-                _record_event(
-                    db, task.id, "coordinator", "error",
-                    summary=f"No adapter binding for role '{task.role}'",
-                )
-                db.commit()
-                _publish_task(task.id)
-                return
+            # Check dependencies
+            if task.depends_on and _get_unmet_dependencies(task, db):
+                continue  # skip — still waiting
 
-            old_owner = task.current_owner
-            task.current_owner = resolved
+            # Check caps
+            adapter = task.current_owner
+            if adapter not in _adapter_registry:
+                continue
+            if not _caps_allow(adapter, task.role):
+                continue  # at capacity — try next tick
+
+            eligible.append(task)
+            _inc_running(adapter, task.role)
+
+            if len(eligible) >= CAPS["global"]:
+                break
+
+        # Claim all eligible tasks
+        for task in eligible:
+            task.locked_by = task.current_owner
+            task.locked_at = datetime.now(timezone.utc)
+            task.attempt_count = (task.attempt_count or 0) + 1
+            task.status = "running"
             _record_event(
-                db, task.id, "coordinator", "status_change",
-                summary=(
-                    f"Resolved role {task.role} to adapter {resolved}"
-                    + (f" (was directly assigned to {old_owner})" if old_owner and old_owner != resolved else "")
-                ),
+                db, task.id, "coordinator", "lock",
+                summary=f"Claimed by {task.current_owner} (attempt {task.attempt_count})",
             )
 
-        # Check dependencies — skip if any aren't done
-        if task.depends_on:
-            unmet = _get_unmet_dependencies(task, db)
-            if unmet:
-                # Task stays queued — it's waiting on dependencies
-                db.commit()  # save any resolution events above
-                _publish_task(task.id)
-                return
-
-        owner = task.current_owner
-        if owner not in _adapter_registry:
-            logger.warning(
-                "Agent Hub: resolved adapter '%s' not in registry for task %s",
-                owner, task.id,
-            )
-            return
-
-        # Claim the task atomically
-        task.locked_by = owner
-        task.locked_at = datetime.now(timezone.utc)
-        task.attempt_count = (task.attempt_count or 0) + 1
-        task.status = "running"
-        _record_event(
-            db, task.id, "coordinator", "lock",
-            summary=f"Claimed by {owner} (attempt {task.attempt_count})",
-        )
         db.commit()
-        db.refresh(task)
-        _publish_task(task.id)
+        task_ids = [t.id for t in eligible]
+        for tid in task_ids:
+            _publish_task(tid)
     finally:
         db.close()
 
-    # Dispatch outside the claim transaction so slow adapters don't hold locks
-    # on the connection pool. Re-open a session for the result write.
-    adapter = _adapter_registry[owner]
-    events = _load_events(task.id)
+    if not eligible:
+        return
 
-    try:
-        result = await adapter.run(task, events)
-    except Exception as exc:
-        result = None
-        error_msg = f"{type(exc).__name__}: {exc}"
+    # Dispatch all in parallel
+    async def _process_one(task):
+        """Claim, dispatch, and record result for a single task."""
+        adapter = _adapter_registry[task.current_owner]
+        events = _load_events(task.id)
+        role = task.role
 
-    # Write result
-    db2 = SessionLocal()
-    try:
-        task = db2.query(AgentTask).filter(AgentTask.id == task.id).first()
-        if not task:
-            return
+        try:
+            result = await adapter.run(task, events)
+        except Exception as exc:
+            result = None
+            error_msg = f"{type(exc).__name__}: {exc}"
 
-        if result is None:
-            # Adapter crashed
-            _record_event(
-                db2, task.id, "coordinator", "error",
-                summary=f"Adapter '{owner}' failed: {error_msg}",
-                content=error_msg,
-            )
-            if task.attempt_count >= MAX_ATTEMPTS:
-                task.status = "blocked"
-                task.last_error = error_msg
+        db2 = SessionLocal()
+        try:
+            t = db2.query(AgentTask).filter(AgentTask.id == task.id).first()
+            if not t:
+                return
+
+            if result is None:
                 _record_event(
-                    db2, task.id, "coordinator", "status_change",
-                    summary=f"Blocked after {task.attempt_count} failed attempts",
+                    db2, t.id, "coordinator", "error",
+                    summary=f"Adapter '{task.current_owner}' failed: {error_msg}",
+                    content=error_msg,
                 )
-            else:
-                task.status = "queued"
-        else:
-            # Adapter succeeded — record the output
-            _record_event(
-                db2, task.id, owner, "message",
-                summary=result.summary,
-                content=result.content,
-                metadata_json=_safe_json_dump(_enrich_metadata(result)),
-            )
-            # Process create_task actions immediately (no approval needed)
-            _execute_create_task_actions(db2, task, result.actions)
-            # Apply proposed transitions
-            if result.needs_approval:
-                # Approval takes precedence over any status proposal.
-                # If the adapter says "needs approval," the task waits for the
-                # user regardless of what status it proposed.
-                task.approval_required = True
-                if task.status not in ("done", "cancelled"):
-                    task.status = "waiting_for_approval"
+                if t.attempt_count >= MAX_ATTEMPTS:
+                    t.status = "blocked"
+                    t.last_error = error_msg
                     _record_event(
-                        db2, task.id, "coordinator", "status_change",
-                        summary="Waiting for user approval",
-                    )
-            elif result.proposed_status:
-                proposed = result.proposed_status
-                if _coordinator_can_transition(task.status, proposed):
-                    old_status = task.status
-                    task.status = proposed
-                    _record_event(
-                        db2, task.id, "coordinator", "status_change",
-                        summary=f"Status: {old_status} → {proposed}",
+                        db2, t.id, "coordinator", "status_change",
+                        summary=f"Blocked after {t.attempt_count} failed attempts",
                     )
                 else:
-                    logger.warning(
-                        "Agent Hub: adapter '%s' proposed invalid transition "
-                        "'%s' → '%s' for task %s",
-                        owner, task.status, proposed, task.id,
-                    )
+                    t.status = "queued"
+            else:
+                _record_event(
+                    db2, t.id, task.current_owner, "message",
+                    summary=result.summary,
+                    content=result.content,
+                    metadata_json=_safe_json_dump(_enrich_metadata(result)),
+                )
+                _execute_create_task_actions(db2, t, result.actions)
 
-            # Apply proposed owner
-            if result.proposed_owner:
-                task.current_owner = result.proposed_owner
+                if result.needs_approval:
+                    t.approval_required = True
+                    if t.status not in ("done", "cancelled"):
+                        t.status = "waiting_for_approval"
+                        _record_event(
+                            db2, t.id, "coordinator", "status_change",
+                            summary="Waiting for user approval",
+                        )
+                elif result.proposed_status:
+                    proposed = result.proposed_status
+                    if _coordinator_can_transition(t.status, proposed):
+                        old_status = t.status
+                        t.status = proposed
+                        _record_event(
+                            db2, t.id, "coordinator", "status_change",
+                            summary=f"Status: {old_status} -> {proposed}",
+                        )
+                    else:
+                        logger.warning(
+                            "Agent Hub: adapter '%s' proposed invalid transition '%s' -> '%s' for task %s",
+                            task.current_owner, t.status, proposed, t.id,
+                        )
 
-        # Release lock (keep locked_at for timing — poll only checks locked_by)
-        task.locked_by = None
-        db2.commit()
-        _publish_task(task.id)
-        _tasks_processed += 1
+                if result.proposed_owner:
+                    t.current_owner = result.proposed_owner
 
-        # Chain: if task completed and has a chain_task_id, auto-create the next one
-        if task.status == "done" and task.chain_task_id:
-            _activate_chain(db2, task)
-    except Exception:
-        logger.exception("Agent Hub: failed to write coordinator result")
-        db2.rollback()
-    finally:
-        db2.close()
+            t.locked_by = None
+            db2.commit()
+            _publish_task(t.id)
+            _tasks_processed += 1
+
+            if t.status == "done" and t.chain_task_id:
+                _activate_chain(db2, t)
+        except Exception:
+            logger.exception("Agent Hub: failed to write coordinator result for %s", task.id)
+            db2.rollback()
+        finally:
+            db2.close()
+            _dec_running(task.current_owner, role)
+
+    await asyncio.gather(*(_process_one(t) for t in eligible))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
