@@ -63,6 +63,8 @@ class TaskCreate(BaseModel):
     session_id: Optional[str] = None
     chain_task_id: Optional[str] = None
     sandbox_mode: str = "workspace-write"
+    depends_on: Optional[list] = None
+    # List of task IDs that must be done before this one runs
 
 
 class TaskUpdate(BaseModel):
@@ -76,6 +78,7 @@ class TaskUpdate(BaseModel):
     session_id: Optional[str] = None
     chain_task_id: Optional[str] = None
     sandbox_mode: Optional[str] = None
+    depends_on: Optional[list] = None
 
 
 class EventCreate(BaseModel):
@@ -125,6 +128,8 @@ def _task_to_dict(t: AgentTask) -> dict:
         "session_id": t.session_id,
         "chain_task_id": t.chain_task_id,
         "sandbox_mode": t.sandbox_mode,
+        "depends_on": t.depends_on,
+        "created_by_task_id": t.created_by_task_id,
         "started_at": started,
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
@@ -168,6 +173,51 @@ def _validate_transition(current_status: str, new_status: str, locked_by: str | 
             409,
             f"Task is locked by '{locked_by}'. Use force_cancel=true to override."
         )
+
+
+def _validate_dependencies(dep_ids: list, db) -> list | None:
+    """Validate a list of dependency task IDs. Returns normalized list or raises HTTPException."""
+    if not isinstance(dep_ids, list):
+        raise HTTPException(400, "depends_on must be a list of task IDs")
+    if len(dep_ids) == 0:
+        return []
+    if len(dep_ids) > 20:
+        raise HTTPException(400, "Too many dependencies (max 20)")
+    seen = set()
+    valid_ids = []
+    for dep_id in dep_ids:
+        if not isinstance(dep_id, str) or not dep_id.strip():
+            raise HTTPException(400, "Each dependency must be a non-empty task ID string")
+        tid = dep_id.strip()
+        if tid in seen:
+            raise HTTPException(400, f"Duplicate dependency: {tid}")
+        seen.add(tid)
+        dep_task = db.query(AgentTask).filter(AgentTask.id == tid).first()
+        if not dep_task:
+            raise HTTPException(400, f"Dependency task not found: {tid}")
+        valid_ids.append(tid)
+    return valid_ids
+
+
+def _detect_dependency_cycle(task_id: str, dep_ids: list, db) -> bool:
+    """Return True if adding these dependencies would create a cycle."""
+    if task_id in dep_ids:
+        return True
+    visited = set()
+    stack = list(dep_ids)
+    while stack:
+        current = stack.pop()
+        if current == task_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        dep_task = db.query(AgentTask).filter(AgentTask.id == current).first()
+        if dep_task and dep_task.depends_on:
+            for d in dep_task.depends_on:
+                if d not in visited:
+                    stack.append(d)
+    return False
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
@@ -246,6 +296,14 @@ def setup_agent_hub_routes() -> APIRouter:
         if body.role is not None and body.role not in VALID_ROLES:
             raise HTTPException(400, f"Invalid role: {body.role}")
 
+        # Validate dependencies
+        dep_ids = None
+        if body.depends_on is not None:
+            dep_ids = _validate_dependencies(body.depends_on, db)
+            # Cycle check: new task doesn't have an ID yet, but we check that
+            # none of the deps transitively depend on each other in a cycle
+            # (full cycle detection happens on update when task has an ID)
+
         task = AgentTask(
             id=str(uuid.uuid4()),
             owner=user,
@@ -255,6 +313,7 @@ def setup_agent_hub_routes() -> APIRouter:
             phase=body.phase,
             current_owner=body.current_owner,
             role=body.role,
+            depends_on=dep_ids,
             approval_required=body.approval_required,
             session_id=body.session_id,
             chain_task_id=body.chain_task_id,
@@ -334,6 +393,11 @@ def setup_agent_hub_routes() -> APIRouter:
                 if body.role not in VALID_ROLES and body.role != "":
                     raise HTTPException(400, f"Invalid role: {body.role}")
                 task.role = body.role if body.role else None
+            if body.depends_on is not None:
+                dep_ids = _validate_dependencies(body.depends_on, db)
+                if _detect_dependency_cycle(task_id, dep_ids, db):
+                    raise HTTPException(400, "Dependency cycle detected")
+                task.depends_on = dep_ids if dep_ids else None
 
             db.commit()
             db.refresh(task)

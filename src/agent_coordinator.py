@@ -104,6 +104,18 @@ def _resolve_role(role: str, task_owner: str | None) -> str | None:
         db.close()
 
 
+def _get_unmet_dependencies(task, db) -> list:
+    """Return list of dep IDs that are NOT done. Empty list = all deps satisfied."""
+    if not task.depends_on:
+        return []
+    unmet = []
+    for dep_id in task.depends_on:
+        dep_task = db.query(AgentTask).filter(AgentTask.id == dep_id).first()
+        if not dep_task or dep_task.status != "done":
+            unmet.append(dep_id)
+    return unmet
+
+
 # ── Coordinator state ─────────────────────────────────────────────────────────
 
 _coordinator_task: asyncio.Task | None = None
@@ -255,7 +267,6 @@ async def _tick():
                 _publish_task(task.id)
                 return
 
-            # Role resolved — set current_owner and record in timeline
             old_owner = task.current_owner
             task.current_owner = resolved
             _record_event(
@@ -265,6 +276,15 @@ async def _tick():
                     + (f" (was directly assigned to {old_owner})" if old_owner and old_owner != resolved else "")
                 ),
             )
+
+        # Check dependencies — skip if any aren't done
+        if task.depends_on:
+            unmet = _get_unmet_dependencies(task, db)
+            if unmet:
+                # Task stays queued — it's waiting on dependencies
+                db.commit()  # save any resolution events above
+                _publish_task(task.id)
+                return
 
         owner = task.current_owner
         if owner not in _adapter_registry:

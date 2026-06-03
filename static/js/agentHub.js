@@ -403,6 +403,7 @@ function _renderTaskList(tasks) {
         </div>
         <div class="ah-task-item-meta">
           ${t.role ? `<span class="ah-task-role-badge">${_esc(t.role)}</span>` : ''}
+          ${t.depends_on && t.depends_on.length ? `<span class="ah-task-dep-badge" title="Waiting on ${t.depends_on.length} dependencies">⏳${t.depends_on.length}</span>` : ''}
           <span class="ah-task-owner">${t.current_owner || 'unassigned'}</span>
           <span class="ah-task-status">${t.status}</span>
           <span class="ah-task-timer ${t.started_at ? '' : 'ah-task-timer--hidden'}"></span>
@@ -493,8 +494,10 @@ function _renderTaskDetail(task) {
       <div class="ah-detail-meta">
         <span class="ah-detail-status">${_statusDot(task.status)} ${task.status}</span>
         <span class="ah-detail-phase">${task.phase || 'no phase'}</span>
-        ${task.role ? `<span class="ah-detail-role">Role: <span class="ah-role-tag">${_esc(task.role)}</span> → <span class="ah-owner-tag">${task.current_owner || 'unresolved'}</span></span>` : ''}
+        ${task.role ? (task.current_owner ? `<span class="ah-detail-role">Role: <span class="ah-role-tag">${_esc(task.role)}</span> → <span class="ah-owner-tag">${task.current_owner}</span></span>` : `<span class="ah-detail-role">Role: <span class="ah-role-tag">${_esc(task.role)}</span> <span class="ah-role-pending">(pending dispatch)</span></span>`) : ''}
         <span class="ah-detail-owner"><span class="ah-owner-tag">${task.current_owner || 'unassigned'}</span></span>
+        ${task.depends_on && task.depends_on.length ? `<span class="ah-detail-deps">Waiting on: ${task.depends_on.map(id => `<span class="ah-dep-tag" data-dep-id="${id}">${id.slice(0,8)}</span>`).join(', ')}</span>` : ''}
+        ${task.created_by_task_id ? `<span class="ah-detail-parent">Created by: <span class="ah-parent-tag" data-parent-id="${task.created_by_task_id}">${task.created_by_task_id.slice(0,8)}</span></span>` : ''}
         ${task.approval_required ? '<span class="ah-detail-approval">Approval required</span>' : ''}
         ${task.locked_by ? `<span class="ah-detail-locked">Locked by ${_esc(task.locked_by)}</span>` : ''}
         ${task.attempt_count > 0 ? `<span class="ah-detail-attempts">Attempt ${task.attempt_count}</span>` : ''}
@@ -737,7 +740,8 @@ function _showNewTaskForm() {
     const sandbox = document.getElementById('ah-new-sandbox').value;
     const role = document.getElementById('ah-new-role')?.value || undefined;
     const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, sandbox_mode: sandbox };
-    if (owner && owner !== 'user') body.status = 'queued';
+    // Auto-queue if assigned to a non-user agent OR a role is set
+    if ((owner && owner !== 'user') || role) body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);
     if (task) {
       if (chainId) {

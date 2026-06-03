@@ -66,6 +66,8 @@ def _task_to_ssedict(t: AgentTask) -> dict:
         "session_id": t.session_id,
         "chain_task_id": t.chain_task_id,
         "sandbox_mode": t.sandbox_mode,
+        "depends_on": t.depends_on,
+        "created_by_task_id": t.created_by_task_id,
         "started_at": started,
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,

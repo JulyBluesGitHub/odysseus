@@ -587,6 +587,10 @@ class AgentTask(TimestampMixin, Base):
     # read-only | workspace-write | danger-full-access
     role              = Column(String, nullable=True)
     # diagnoser | implementer | verifier — workflow role, resolved to adapter at claim time
+    depends_on        = Column(JSON, nullable=True)
+    # List of task IDs that must be done before this task can be dispatched
+    created_by_task_id = Column(String, nullable=True)
+    # ID of the task that spawned this one (agent-created subtasks)
 
     __table_args__ = (
         Index('ix_agent_tasks_status_owner', 'status', 'owner'),
@@ -1653,6 +1657,8 @@ def init_db():
     _migrate_add_agent_task_sandbox_mode()
     _migrate_add_agent_task_role_column()
     _migrate_add_role_bindings_table()
+    _migrate_add_agent_task_depends_on_column()
+    _migrate_add_agent_task_created_by_column()
 
 
 def _migrate_add_agent_task_chain_column():
@@ -1777,6 +1783,44 @@ def _migrate_add_role_bindings_table():
         conn.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"role_bindings migration failed: {e}")
+
+
+def _migrate_add_agent_task_depends_on_column():
+    """Add depends_on JSON column to agent_tasks."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(agent_tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "depends_on" not in columns:
+            conn.execute("ALTER TABLE agent_tasks ADD COLUMN depends_on TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added depends_on column to agent_tasks")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.depends_on migration failed: {e}")
+
+
+def _migrate_add_agent_task_created_by_column():
+    """Add created_by_task_id column to agent_tasks."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(agent_tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "created_by_task_id" not in columns:
+            conn.execute("ALTER TABLE agent_tasks ADD COLUMN created_by_task_id TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added created_by_task_id column to agent_tasks")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.created_by_task_id migration failed: {e}")
 
 
 def _migrate_add_email_smtp_security():

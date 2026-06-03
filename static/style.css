@@ -21573,6 +21573,31 @@ body:not(.welcome-ready) #welcome-screen {
   font-size: 11px; font-weight: 600; color: #5b8abf;
   text-transform: capitalize;
 }
+.ah-role-pending {
+  font-size: 10px; opacity: 0.5; font-style: italic;
+}
+/* Dependency display */
+.ah-detail-deps {
+  font-size: 11px; margin-right: 8px; white-space: nowrap;
+}
+.ah-dep-tag {
+  font-size: 10px; font-family: monospace; opacity: 0.7;
+  cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ah-detail-parent {
+  font-size: 11px; margin-right: 8px; white-space: nowrap;
+}
+.ah-parent-tag {
+  font-size: 10px; font-family: monospace; opacity: 0.7;
+  cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ah-task-dep-badge {
+  font-size: 9px; font-weight: 600; padding: 0 5px; border-radius: 3px;
+  background: color-mix(in srgb, #f0a030 20%, transparent);
+  color: #f0a030; white-space: nowrap; line-height: 16px;
+}
 /* Bindings button in header */
 .ah-bindings-btn {
   background: none; border: none; font-size: 14px;
