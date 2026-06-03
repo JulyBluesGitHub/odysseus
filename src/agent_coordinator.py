@@ -46,7 +46,7 @@ CAPS = {
     "adapter": {
         k: int(v) for k, v in
         (item.split(":") for item in os.getenv(
-            "AGENT_HUB_CAP_ADAPTER", "codex:1,cursor:1,hermes:2"
+            "AGENT_HUB_CAP_ADAPTER", "codex:1,hermes:2"
         ).split(","))
     },
     "role": {
