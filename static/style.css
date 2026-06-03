@@ -21558,6 +21558,48 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-task-timer--blocked { color: #cc4444; }
 .ah-task-timer--cancelled { color: #888; }
 
+/* Role badge in task list */
+.ah-task-role-badge {
+  font-size: 9px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.3px; padding: 0 5px; border-radius: 3px;
+  background: color-mix(in srgb, #5b8abf 20%, transparent);
+  color: #5b8abf; white-space: nowrap; line-height: 16px;
+}
+/* Role tag in detail view */
+.ah-detail-role {
+  font-size: 11px; margin-right: 8px; white-space: nowrap;
+}
+.ah-role-tag {
+  font-size: 11px; font-weight: 600; color: #5b8abf;
+  text-transform: capitalize;
+}
+/* Bindings button in header */
+.ah-bindings-btn {
+  background: none; border: none; font-size: 14px;
+  cursor: pointer; color: var(--fg, #ccc); opacity: 0.6;
+  padding: 0 6px; line-height: 1;
+}
+.ah-bindings-btn:hover { opacity: 1; }
+/* Bindings panel */
+.ah-bindings-hint {
+  font-size: 11px; opacity: 0.6; margin-bottom: 12px;
+}
+.ah-bindings-list {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.ah-binding-row {
+  display: flex; align-items: center; gap: 8px; font-size: 13px;
+}
+.ah-binding-role {
+  min-width: 120px; font-weight: 500; text-transform: capitalize;
+}
+.ah-binding-arrow { opacity: 0.4; }
+.ah-binding-select {
+  font-size: 12px; padding: 2px 6px;
+  background: var(--bg-input, #1a1a1a); color: var(--fg, #ccc);
+  border: 1px solid var(--border, #333); border-radius: 3px;
+}
+
 /* Sidebar notification dot */
 .ah-notif-dot {
   display: inline-flex; align-items: center; justify-content: center;

@@ -80,6 +80,7 @@ function _getModal() {
         <span class="modal-title">Agent Hub</span>
         <div class="ah-header-status" id="ah-coordinator-status"></div>
         <div class="modal-header-actions">
+          <button class="ah-bindings-btn" id="ah-bindings-btn" title="Role Bindings">⚙</button>
           <button class="ah-refresh-btn" title="Refresh">⟳</button>
           <button class="modal-minimize-btn">_</button>
           <button class="modal-close-btn close-btn">✕</button>
@@ -141,6 +142,7 @@ function _getModal() {
     _stopListTimer();
   });
   modal.querySelector('.ah-refresh-btn').addEventListener('click', () => _fetchAndRender());
+  modal.querySelector('#ah-bindings-btn')?.addEventListener('click', () => _showBindings());
   modal.querySelector('#ah-new-task-btn').addEventListener('click', () => _showNewTaskForm());
   modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
@@ -400,6 +402,7 @@ function _renderTaskList(tasks) {
           <button class="ah-task-delete-btn" data-delete-id="${t.id}" title="Delete task">×</button>
         </div>
         <div class="ah-task-item-meta">
+          ${t.role ? `<span class="ah-task-role-badge">${_esc(t.role)}</span>` : ''}
           <span class="ah-task-owner">${t.current_owner || 'unassigned'}</span>
           <span class="ah-task-status">${t.status}</span>
           <span class="ah-task-timer ${t.started_at ? '' : 'ah-task-timer--hidden'}"></span>
@@ -490,6 +493,7 @@ function _renderTaskDetail(task) {
       <div class="ah-detail-meta">
         <span class="ah-detail-status">${_statusDot(task.status)} ${task.status}</span>
         <span class="ah-detail-phase">${task.phase || 'no phase'}</span>
+        ${task.role ? `<span class="ah-detail-role">Role: <span class="ah-role-tag">${_esc(task.role)}</span> → <span class="ah-owner-tag">${task.current_owner || 'unresolved'}</span></span>` : ''}
         <span class="ah-detail-owner"><span class="ah-owner-tag">${task.current_owner || 'unassigned'}</span></span>
         ${task.approval_required ? '<span class="ah-detail-approval">Approval required</span>' : ''}
         ${task.locked_by ? `<span class="ah-detail-locked">Locked by ${_esc(task.locked_by)}</span>` : ''}
@@ -686,6 +690,14 @@ function _showNewTaskForm() {
         </select>
       </div>
       <div class="ah-new-task-row">
+        <select class="ah-input" id="ah-new-role">
+          <option value="">Role (optional)</option>
+          <option value="diagnoser">Diagnoser</option>
+          <option value="implementer">Implementer</option>
+          <option value="verifier">Verifier</option>
+        </select>
+      </div>
+      <div class="ah-new-task-row">
         <input class="ah-input" id="ah-new-chain" placeholder="Triggered by task ID (optional)" value="" style="flex:1;">
       </div>
       <div class="ah-new-task-row ah-new-task-row--sandbox">
@@ -723,7 +735,8 @@ function _showNewTaskForm() {
     const phase = document.getElementById('ah-new-phase').value;
     const chainId = document.getElementById('ah-new-chain').value.trim();
     const sandbox = document.getElementById('ah-new-sandbox').value;
-    const body = { title, objective, current_owner: owner || undefined, phase: phase || undefined, sandbox_mode: sandbox };
+    const role = document.getElementById('ah-new-role')?.value || undefined;
+    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, sandbox_mode: sandbox };
     if (owner && owner !== 'user') body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);
     if (task) {
@@ -899,6 +912,81 @@ function _teardown() {
   _stopListTimer();
   const modal = document.getElementById(MODAL_ID);
   if (modal) modal.style.display = 'none';
+}
+
+// ── Role Bindings ─────────────────────────────────────────────────────────────
+
+let _bindingsVisible = false;
+
+async function _showBindings() {
+  const container = document.getElementById('ah-task-detail');
+  if (!container) return;
+
+  if (_bindingsVisible) {
+    _bindingsVisible = false;
+    _renderEmptyDetail();
+    return;
+  }
+
+  _bindingsVisible = true;
+  _selectedTaskId = null;
+  _detailTimerSince = null;
+
+  const bindings = await _fetchBindings();
+
+  container.innerHTML = `
+    <div class="ah-new-task-form">
+      <h3>Role Bindings</h3>
+      <p class="ah-bindings-hint">Tasks target roles. The coordinator resolves roles to agents at dispatch time.</p>
+      <div class="ah-bindings-list" id="ah-bindings-list">
+        ${bindings.map(b => _renderBindingRow(b)).join('')}
+      </div>
+    </div>
+  `;
+
+  // Wire up dropdowns for changing bindings
+  container.querySelectorAll('.ah-binding-select').forEach(select => {
+    select.addEventListener('change', async () => {
+      const role = select.dataset.role;
+      const owner = select.dataset.owner || null;
+      const adapter = select.value;
+      await _updateBinding(role, adapter, owner);
+      _showBindings(); // refresh
+    });
+  });
+}
+
+async function _fetchBindings() {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent-hub/bindings`, { credentials: 'same-origin' });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.bindings || [];
+  } catch (_) { return []; }
+}
+
+async function _updateBinding(role, adapter_name, owner) {
+  await fetch(`${API_BASE}/api/agent-hub/bindings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ role, adapter_name, owner }),
+  });
+}
+
+function _renderBindingRow(b) {
+  const ownerLabel = b.owner ? ` (${b.owner})` : ' (global)';
+  return `
+    <div class="ah-binding-row">
+      <span class="ah-binding-role">${_esc(b.role)}${ownerLabel}</span>
+      <span class="ah-binding-arrow">→</span>
+      <select class="ah-binding-select" data-role="${b.role}" data-owner="${b.owner || ''}">
+        <option value="hermes" ${b.adapter_name === 'hermes' ? 'selected' : ''}>Hermes</option>
+        <option value="codex" ${b.adapter_name === 'codex' ? 'selected' : ''}>Codex</option>
+        <option value="cursor" ${b.adapter_name === 'cursor' ? 'selected' : ''}>Cursor</option>
+      </select>
+    </div>
+  `;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

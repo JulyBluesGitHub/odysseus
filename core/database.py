@@ -585,9 +585,32 @@ class AgentTask(TimestampMixin, Base):
     # ID of the next task to auto-create when this one completes
     sandbox_mode      = Column(String, nullable=False, default="workspace-write")
     # read-only | workspace-write | danger-full-access
+    role              = Column(String, nullable=True)
+    # diagnoser | implementer | verifier — workflow role, resolved to adapter at claim time
 
     __table_args__ = (
         Index('ix_agent_tasks_status_owner', 'status', 'owner'),
+    )
+
+
+class RoleBinding(TimestampMixin, Base):
+    """Maps a workflow role to an adapter at dispatch time.
+
+    Tasks target roles (diagnoser, implementer, verifier), not specific agents.
+    The coordinator resolves role → adapter via this table at claim time.
+    Users can change bindings mid-pipeline; the next queued task picks up the
+    new adapter.
+    """
+    __tablename__ = "role_bindings"
+
+    id           = Column(String, primary_key=True, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    role         = Column(String, nullable=False)
+    adapter_name = Column(String, nullable=False)
+    # adapter_name must be in the coordinator's adapter registry (hermes, codex, cursor)
+
+    __table_args__ = (
+        Index('ix_role_bindings_owner_role', 'owner', 'role', unique=True),
     )
 
 
@@ -1628,6 +1651,8 @@ def init_db():
     _migrate_encrypt_endpoint_keys()
     _migrate_add_agent_task_chain_column()
     _migrate_add_agent_task_sandbox_mode()
+    _migrate_add_agent_task_role_column()
+    _migrate_add_role_bindings_table()
 
 
 def _migrate_add_agent_task_chain_column():
@@ -1674,6 +1699,84 @@ def _migrate_add_agent_task_sandbox_mode():
         logging.getLogger(__name__).warning(
             f"agent_tasks.sandbox_mode migration failed: {e}"
         )
+
+
+def _migrate_add_agent_task_role_column():
+    """Add role column to agent_tasks (nullable — existing tasks have no role)."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(agent_tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns and "role" not in columns:
+            conn.execute("ALTER TABLE agent_tasks ADD COLUMN role TEXT")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added role column to agent_tasks")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.role migration failed: {e}")
+
+
+def _migrate_add_role_bindings_table():
+    """Create role_bindings table and seed default bindings if empty."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        # PRAGMA foreign_keys is session-local — enable it for this connection
+        conn.execute("PRAGMA foreign_keys = OFF")
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='role_bindings'"
+        )
+        if not cursor.fetchone():
+            conn.execute("""
+                CREATE TABLE role_bindings (
+                    id TEXT NOT NULL,
+                    owner TEXT,
+                    role TEXT NOT NULL,
+                    adapter_name TEXT NOT NULL,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    PRIMARY KEY (id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS ix_role_bindings_owner_role
+                ON role_bindings (owner, role)
+            """)
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: created role_bindings table")
+
+        # Seed default bindings if table is empty
+        count = conn.execute("SELECT COUNT(*) FROM role_bindings").fetchone()[0]
+        if count == 0:
+            import uuid as _uuid
+            from datetime import datetime as _dt
+            now = _dt.utcnow().isoformat()
+            defaults = [
+                ("diagnoser", "hermes"),
+                ("implementer", "codex"),
+                ("verifier", "hermes"),
+            ]
+            for role, adapter in defaults:
+                bid = str(_uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO role_bindings (id, owner, role, adapter_name, created_at, updated_at) "
+                    "VALUES (?, NULL, ?, ?, ?, ?)",
+                    (bid, role, adapter, now, now),
+                )
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Seeded default role bindings: diagnoser→hermes, implementer→codex, verifier→hermes"
+            )
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"role_bindings migration failed: {e}")
 
 
 def _migrate_add_email_smtp_security():

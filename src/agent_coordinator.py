@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 from core.database import SessionLocal, AgentTask, AgentEvent
 from src.agent_hub_events import publish as _publish_event
+from sqlalchemy import or_
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,40 @@ def _coordinator_can_transition(current: str, proposed: str) -> bool:
     """Check whether the coordinator is allowed to make this transition."""
     allowed = _COORDINATOR_TRANSITIONS.get(current, set())
     return proposed in allowed
+
+
+# ── Role resolution ────────────────────────────────────────────────────────────
+
+VALID_ROLES = {"diagnoser", "implementer", "verifier"}
+
+
+def _resolve_role(role: str, task_owner: str | None) -> str | None:
+    """Look up the adapter bound to a role for a given owner.
+
+    Checks owner-specific bindings first, then global (owner=None) bindings.
+    Returns the adapter_name (hermes, codex, cursor) or None if no binding exists.
+    """
+    from core.database import SessionLocal as _SL, RoleBinding
+    db = _SL()
+    try:
+        # Owner-specific binding takes priority
+        if task_owner:
+            binding = (
+                db.query(RoleBinding)
+                .filter(RoleBinding.role == role, RoleBinding.owner == task_owner)
+                .first()
+            )
+            if binding:
+                return binding.adapter_name
+        # Fall back to global binding
+        binding = (
+            db.query(RoleBinding)
+            .filter(RoleBinding.role == role, RoleBinding.owner == None)  # noqa: E711
+            .first()
+        )
+        return binding.adapter_name if binding else None
+    finally:
+        db.close()
 
 
 # ── Coordinator state ─────────────────────────────────────────────────────────
@@ -167,20 +202,27 @@ async def _coordinator_loop():
 async def _tick():
     """Single coordinator tick — claim one task and dispatch it.
 
-    Processes at most one task per tick to keep the loop simple and avoid
-    monopolising the event loop. Queued tasks queue up naturally over ticks.
+    Tasks can target a role (diagnoser/implementer/verifier) or specify an
+    adapter directly via current_owner. For role-based tasks, the coordinator
+    resolves role → adapter via the RoleBinding table at claim time and records
+    the resolution in the timeline.
     """
     global _tasks_processed
 
     db = SessionLocal()
     try:
-        # Find the oldest queued, unlocked task with a registered owner
+        # Find the oldest queued, unlocked task that is either:
+        # - directly assigned to a registered adapter, OR
+        # - assigned to a role (will be resolved below)
         task = (
             db.query(AgentTask)
             .filter(
                 AgentTask.status == "queued",
-                AgentTask.current_owner.in_(_adapter_registry.keys()),
                 AgentTask.locked_by.is_(None),
+                or_(
+                    AgentTask.current_owner.in_(_adapter_registry.keys()),
+                    AgentTask.role.isnot(None),
+                ),
             )
             .order_by(AgentTask.created_at)
             .first()
@@ -188,8 +230,51 @@ async def _tick():
         if not task:
             return
 
-        # Claim the task atomically
+        # Resolve role → adapter if needed
+        if task.role:
+            if task.role not in VALID_ROLES:
+                task.status = "blocked"
+                task.last_error = f"Invalid role: {task.role}"
+                _record_event(
+                    db, task.id, "coordinator", "error",
+                    summary=f"Invalid role '{task.role}' — valid roles: {', '.join(sorted(VALID_ROLES))}",
+                )
+                db.commit()
+                _publish_task(task.id)
+                return
+
+            resolved = _resolve_role(task.role, task.owner)
+            if not resolved:
+                task.status = "blocked"
+                task.last_error = f"No adapter bound to role '{task.role}'"
+                _record_event(
+                    db, task.id, "coordinator", "error",
+                    summary=f"No adapter binding for role '{task.role}'",
+                )
+                db.commit()
+                _publish_task(task.id)
+                return
+
+            # Role resolved — set current_owner and record in timeline
+            old_owner = task.current_owner
+            task.current_owner = resolved
+            _record_event(
+                db, task.id, "coordinator", "status_change",
+                summary=(
+                    f"Resolved role {task.role} to adapter {resolved}"
+                    + (f" (was directly assigned to {old_owner})" if old_owner and old_owner != resolved else "")
+                ),
+            )
+
         owner = task.current_owner
+        if owner not in _adapter_registry:
+            logger.warning(
+                "Agent Hub: resolved adapter '%s' not in registry for task %s",
+                owner, task.id,
+            )
+            return
+
+        # Claim the task atomically
         task.locked_by = owner
         task.locked_at = datetime.now(timezone.utc)
         task.attempt_count = (task.attempt_count or 0) + 1

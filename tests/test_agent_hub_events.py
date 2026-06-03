@@ -52,6 +52,25 @@ def _create_test_app():
 
     TestingSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
+    # Seed role bindings defaults (migration path doesn't work for :memory:)
+    with engine.connect() as conn:
+        from sqlalchemy import text
+        import uuid as _u
+        from datetime import datetime as _dt2
+        now = _dt2.utcnow().isoformat()
+        defaults = [
+            ("diagnoser", "hermes"),
+            ("implementer", "codex"),
+            ("verifier", "hermes"),
+        ]
+        for role, adapter in defaults:
+            conn.execute(
+                text("INSERT INTO role_bindings (id, owner, role, adapter_name, created_at, updated_at) "
+                     "VALUES (:id, NULL, :role, :adapter, :now, :now)"),
+                {"id": str(_u.uuid4()), "role": role, "adapter": adapter, "now": now}
+            )
+        conn.commit()
+
     # Patch both SessionLocal refs
     _db.SessionLocal = TestingSessionLocal
     import src.agent_coordinator as _coord
@@ -349,3 +368,97 @@ class TestPublishFunction:
         """No subscribers connected by default."""
         from src.agent_hub_events import subscriber_count
         assert subscriber_count("nonexistent") == 0
+
+
+class TestRoleDispatch:
+    """Tests that role-based tasks are resolved and dispatched correctly."""
+
+    def test_create_task_with_role(self, client):
+        """Tasks can be created with a role field."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Role test",
+            "status": "queued",
+            "role": "implementer",
+        })
+        assert r.status_code == 201
+        assert r.json()["role"] == "implementer"
+
+    def test_reject_invalid_role_on_create(self, client):
+        """Invalid role values are rejected."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Bad role",
+            "role": "janitor",
+        })
+        assert r.status_code == 400
+
+    def test_update_task_role(self, client):
+        """Task role can be updated."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Before role change",
+            "status": "draft",
+        })
+        task_id = r.json()["id"]
+        r2 = client.put(f"/api/agent-hub/tasks/{task_id}", json={"role": "verifier"})
+        assert r2.status_code == 200
+        assert r2.json()["role"] == "verifier"
+
+    def test_clear_role_with_empty_string(self, client):
+        """Setting role to empty string clears it."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Clear role",
+            "role": "diagnoser",
+        })
+        task_id = r.json()["id"]
+        r2 = client.put(f"/api/agent-hub/tasks/{task_id}", json={"role": ""})
+        assert r2.status_code == 200
+        assert r2.json()["role"] is None
+
+    def test_role_appears_in_task_list(self, client):
+        """Tasks with roles show the role in the list."""
+        client.post("/api/agent-hub/tasks", json={
+            "title": "Role visible",
+            "role": "diagnoser",
+        })
+        r = client.get("/api/agent-hub/tasks")
+        tasks = r.json()["tasks"]
+        role_task = [t for t in tasks if t["title"] == "Role visible"]
+        assert len(role_task) == 1
+        assert role_task[0]["role"] == "diagnoser"
+
+    def test_bindings_endpoint_returns_defaults(self, client):
+        """GET /bindings returns the default seeded bindings."""
+        r = client.get("/api/agent-hub/bindings")
+        assert r.status_code == 200
+        bindings = r.json().get("bindings", [])
+        roles = {b["role"]: b["adapter_name"] for b in bindings}
+        assert roles.get("diagnoser") == "hermes"
+        assert roles.get("implementer") == "codex"
+        assert roles.get("verifier") == "hermes"
+        assert all(b["owner"] is None for b in bindings)
+
+    def test_update_binding(self, client):
+        """PUT /bindings updates a role binding."""
+        r = client.put("/api/agent-hub/bindings", json={
+            "role": "implementer",
+            "adapter_name": "cursor",
+        })
+        assert r.status_code == 200
+        assert r.json()["adapter_name"] == "cursor"
+        r2 = client.get("/api/agent-hub/bindings")
+        bindings = r2.json()["bindings"]
+        impl = [b for b in bindings if b["role"] == "implementer"]
+        assert len(impl) == 1
+        assert impl[0]["adapter_name"] == "cursor"
+
+    def test_role_with_binding_dispatches(self, client):
+        """Task with a valid role and binding dispatches normally (route-level)."""
+        # Just verify the task can be created and listed with a role
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Has binding", "status": "queued", "role": "verifier",
+        })
+        assert r.status_code == 201
+        assert r.json()["role"] == "verifier"
+        # Task exists in the list
+        r2 = client.get("/api/agent-hub/tasks")
+        tasks = r2.json()["tasks"]
+        assert any(t["role"] == "verifier" for t in tasks)

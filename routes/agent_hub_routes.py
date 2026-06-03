@@ -48,6 +48,7 @@ VALID_ACTORS = {"user", "hermes", "codex", "cursor", "coordinator"}
 VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock"}
 VALID_OWNERS = {"user", "hermes", "codex", "cursor"}
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+VALID_ROLES = {"diagnoser", "implementer", "verifier"}
 
 
 class TaskCreate(BaseModel):
@@ -56,6 +57,8 @@ class TaskCreate(BaseModel):
     status: str = "draft"
     phase: Optional[str] = None
     current_owner: Optional[str] = None
+    role: Optional[str] = None
+    # diagnoser | implementer | verifier — resolved to adapter at dispatch time
     approval_required: bool = False
     session_id: Optional[str] = None
     chain_task_id: Optional[str] = None
@@ -68,6 +71,7 @@ class TaskUpdate(BaseModel):
     status: Optional[str] = None
     phase: Optional[str] = None
     current_owner: Optional[str] = None
+    role: Optional[str] = None
     approval_required: Optional[bool] = None
     session_id: Optional[str] = None
     chain_task_id: Optional[str] = None
@@ -112,6 +116,7 @@ def _task_to_dict(t: AgentTask) -> dict:
         "status": t.status,
         "phase": t.phase,
         "current_owner": t.current_owner,
+        "role": t.role,
         "approval_required": t.approval_required,
         "locked_by": t.locked_by,
         "locked_at": t.locked_at.isoformat() + "Z" if t.locked_at else None,
@@ -238,6 +243,8 @@ def setup_agent_hub_routes() -> APIRouter:
             raise HTTPException(400, f"Invalid current_owner: {body.current_owner}")
         if body.sandbox_mode not in VALID_SANDBOX_MODES:
             raise HTTPException(400, f"Invalid sandbox_mode: {body.sandbox_mode}")
+        if body.role is not None and body.role not in VALID_ROLES:
+            raise HTTPException(400, f"Invalid role: {body.role}")
 
         task = AgentTask(
             id=str(uuid.uuid4()),
@@ -247,6 +254,7 @@ def setup_agent_hub_routes() -> APIRouter:
             status=body.status,
             phase=body.phase,
             current_owner=body.current_owner,
+            role=body.role,
             approval_required=body.approval_required,
             session_id=body.session_id,
             chain_task_id=body.chain_task_id,
@@ -322,6 +330,10 @@ def setup_agent_hub_routes() -> APIRouter:
                 if body.sandbox_mode not in VALID_SANDBOX_MODES:
                     raise HTTPException(400, f"Invalid sandbox_mode: {body.sandbox_mode}")
                 task.sandbox_mode = body.sandbox_mode
+            if body.role is not None:
+                if body.role not in VALID_ROLES and body.role != "":
+                    raise HTTPException(400, f"Invalid role: {body.role}")
+                task.role = body.role if body.role else None
 
             db.commit()
             db.refresh(task)
@@ -474,6 +486,108 @@ def setup_agent_hub_routes() -> APIRouter:
             }
         finally:
             db2.close()
+
+    # ── Role Bindings ──────────────────────────────────────────────────────
+
+    @router.get("/bindings")
+    async def list_bindings(request: Request):
+        """List role bindings for the current user.
+
+        Returns global (owner=None) bindings and any owner-specific overrides.
+        """
+        from core.database import RoleBinding
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            bindings = (
+                db.query(RoleBinding)
+                .filter(
+                    (RoleBinding.owner == user) | (RoleBinding.owner == None)  # noqa: E711
+                )
+                .order_by(RoleBinding.role, RoleBinding.owner)
+                .all()
+            )
+            return {
+                "bindings": [
+                    {
+                        "id": b.id,
+                        "owner": b.owner,
+                        "role": b.role,
+                        "adapter_name": b.adapter_name,
+                    }
+                    for b in bindings
+                ]
+            }
+        finally:
+            db.close()
+
+    @router.put("/bindings")
+    async def update_binding(request: Request):
+        """Create or update a role binding. Body: {role, adapter_name}.
+
+        If a binding for this owner+role already exists, it's updated.
+        Otherwise a new binding is created. Passing owner=null creates a
+        global binding (only if no owner-specific override exists for that
+        role).
+        """
+        from core.database import RoleBinding
+        user = get_current_user(request)
+        import json as _json
+        body = await request.json()
+        role = (body.get("role") or "").strip()
+        adapter = (body.get("adapter_name") or "").strip()
+        owner = body.get("owner")  # None = global, string = owner-specific
+
+        if not role or role not in VALID_ROLES:
+            raise HTTPException(400, f"Invalid role: {role}")
+        if adapter and adapter not in VALID_OWNERS:
+            raise HTTPException(400, f"Invalid adapter_name: {adapter}")
+
+        db = SessionLocal()
+        try:
+            # Authorize: only admins can set global bindings (best-effort)
+            if owner is None and user:
+                try:
+                    from core.auth import auth_manager
+                    _users = getattr(auth_manager, "users", {})
+                    _user_data = _users.get(user, {})
+                    if not _user_data.get("is_admin"):
+                        raise HTTPException(403, "Only admins can set global bindings")
+                except ImportError:
+                    pass  # test context — allow global bindings
+
+            binding = (
+                db.query(RoleBinding)
+                .filter(
+                    RoleBinding.role == role,
+                    (RoleBinding.owner == owner) if owner else (RoleBinding.owner == None),  # noqa: E711
+                )
+                .first()
+            )
+
+            if binding:
+                binding.adapter_name = adapter
+            else:
+                binding = RoleBinding(
+                    id=str(uuid.uuid4()),
+                    owner=owner,
+                    role=role,
+                    adapter_name=adapter,
+                )
+                db.add(binding)
+
+            db.commit()
+            db.refresh(binding)
+            return {
+                "id": binding.id,
+                "owner": binding.owner,
+                "role": binding.role,
+                "adapter_name": binding.adapter_name,
+            }
+        finally:
+            db.close()
+
+    # ── Transition ─────────────────────────────────────────────────────────
 
     @router.post("/tasks/{task_id}/transition")
     async def transition_task(request: Request, task_id: str, body: TransitionRequest):
