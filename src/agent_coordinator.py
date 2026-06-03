@@ -315,6 +315,231 @@ def _caps_allow(adapter: str, role: str | None) -> bool:
     return True
 
 
+# ── Context briefs ─────────────────────────────────────────────────────────────
+
+# Brief generation limits
+_MAX_SIMILAR_TASKS = 5
+_MAX_DEP_EVENTS = 8
+_MAX_EVENT_CONTENT_CHARS = 500
+_MAX_BRIEF_CHARS = 6000
+
+# Cache of last fingerprint per task to detect duplicates
+_last_brief_fingerprints: dict[str, str] = {}
+
+
+def _brief_fingerprint(task) -> str:
+    """Compute a fingerprint for dedup: task ID + role + dep task IDs + dep statuses."""
+    import hashlib
+    parts = [task.id, task.role or "", task.status]
+    if task.depends_on:
+        parts.extend(sorted(task.depends_on))
+        # Include dependency statuses so brief regenerates when deps complete
+        dep_statuses = _get_dep_statuses(task)
+        parts.extend(dep_statuses)
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _get_dep_statuses(task) -> list:
+    """Get status strings for each dependency task."""
+    from core.database import SessionLocal as _SL
+    if not task.depends_on:
+        return []
+    db = _SL()
+    try:
+        dep_tasks = db.query(AgentTask).filter(AgentTask.id.in_(task.depends_on)).all()
+        return sorted(f"{t.id}:{t.status}" for t in dep_tasks)
+    finally:
+        db.close()
+
+
+def _brief_similar_tasks(db, task) -> list[dict]:
+    """Find up to _MAX_SIMILAR_TASKS past tasks similar to this one.
+
+    Excludes the task itself, its dependency chain, and prior context events.
+    Owner-scoped. Matches on title keywords.
+    """
+    if not task.title:
+        return []
+    # Extract keywords (words > 3 chars)
+    keywords = [w.lower() for w in task.title.split() if len(w) > 3]
+    if not keywords:
+        return []
+
+    # Build a rough ILIKE filter
+    from sqlalchemy import or_ as _or
+    filters = []
+    for kw in keywords[:5]:  # max 5 keywords
+        filters.append(AgentTask.title.ilike(f"%{kw}%"))
+        filters.append(AgentTask.objective.ilike(f"%{kw}%"))
+
+    # Exclude self and dependency chain
+    exclude_ids = {task.id}
+    if task.depends_on:
+        exclude_ids.update(task.depends_on)
+
+    similar = (
+        db.query(AgentTask)
+        .filter(
+            AgentTask.owner == task.owner,
+            AgentTask.id.notin_(exclude_ids),
+            _or(*filters),
+        )
+        .order_by(AgentTask.updated_at.desc())
+        .limit(_MAX_SIMILAR_TASKS)
+        .all()
+    )
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "status": t.status,
+            "role": t.role,
+            "summary": (t.objective or "")[:200],
+        }
+        for t in similar
+    ]
+
+
+def _brief_dependency_events(db, task) -> list[dict]:
+    """Extract up to _MAX_DEP_EVENTS events from dependency tasks.
+
+    Skips context events to avoid recursive bloat. Returns newest first.
+    """
+    if not task.depends_on:
+        return []
+    events = (
+        db.query(AgentEvent)
+        .filter(
+            AgentEvent.task_id.in_(task.depends_on),
+            AgentEvent.event_type != "context",
+        )
+        .order_by(AgentEvent.created_at.desc())
+        .limit(_MAX_DEP_EVENTS)
+        .all()
+    )
+    return [
+        {
+            "task_id": e.task_id,
+            "actor": e.actor,
+            "event_type": e.event_type,
+            "summary": e.summary or "",
+            "content": (e.content or "")[:_MAX_EVENT_CONTENT_CHARS],
+        }
+        for e in events
+    ]
+
+
+def _build_role_context_brief(db, task) -> str | None:
+    """Build a role-specific context brief. Returns None if identical to last brief."""
+    import hashlib
+
+    fp = _brief_fingerprint(task)
+    if _last_brief_fingerprints.get(task.id) == fp:
+        return None  # fingerprint unchanged — skip duplicate
+
+    role = task.role or ""
+    lines = [f"# Context Brief — {role or 'General'}", ""]
+
+    # ── Common: task info ──
+    lines.append(f"**Task:** {task.title}")
+    if task.objective:
+        lines.append(f"**Objective:** {task.objective}")
+    lines.append("")
+
+    # ── Role-specific sections ──
+    if role == "diagnoser":
+        lines.append("## Similar Past Tasks")
+        similar = _brief_similar_tasks(db, task)
+        if similar:
+            for s in similar:
+                lines.append(f"- [{s['status']}] {s['title']} (role: {s.get('role', 'none')})")
+                if s.get("summary"):
+                    lines.append(f"  {s['summary'][:120]}")
+        else:
+            lines.append("(none found)")
+        lines.append("")
+
+        # Include recent error events from deps
+        dep_events = _brief_dependency_events(db, task)
+        errors = [e for e in dep_events if e["event_type"] == "error"]
+        if errors:
+            lines.append("## Recent Errors from Dependencies")
+            for e in errors[:3]:
+                lines.append(f"- {e['summary']}")
+
+    elif role == "implementer":
+        lines.append("## Diagnosis Summary")
+        dep_events = _brief_dependency_events(db, task)
+        msgs = [e for e in dep_events if e["event_type"] in ("message", "status_change")]
+        if msgs:
+            for e in msgs[:_MAX_DEP_EVENTS]:
+                lines.append(f"- [{e['actor']}] {e['summary']}")
+                if e.get("content"):
+                    lines.append(f"  {e['content'][:200]}")
+        else:
+            lines.append("(no diagnosis from dependencies)")
+        lines.append("")
+
+        if task.objective:
+            lines.append("## Acceptance Criteria")
+            lines.append(task.objective[:_MAX_BRIEF_CHARS // 3])
+        lines.append("")
+
+    elif role == "verifier":
+        lines.append("## Original Objective")
+        dep_events = _brief_dependency_events(db, task)
+        msgs = [e for e in dep_events if e["event_type"] in ("message", "status_change", "error")]
+        if msgs:
+            for e in msgs[:4]:
+                lines.append(f"- [{e['actor']}] {e['summary']}")
+        lines.append("")
+
+        lines.append("## Implementation Evidence")
+        # Look for shell/file actions, test output, status changes
+        evidence = [e for e in dep_events
+                    if e["event_type"] in ("message", "status_change")
+                    or (e.get("content") and any(
+                        kw in (e.get("content") or "").lower()
+                        for kw in ("test", "pass", "fail", "build", "compile", "error")
+                    ))]
+        if evidence:
+            for e in evidence[:6]:
+                lines.append(f"- [{e['actor']}] {e['summary']}")
+                if e.get("content"):
+                    lines.append(f"  {e['content'][:200]}")
+        else:
+            lines.append("(no implementation evidence from dependencies)")
+    else:
+        # No role — generic brief
+        if task.depends_on:
+            lines.append("## Dependencies")
+            dep_statuses = _get_dep_statuses(task)
+            for ds in dep_statuses:
+                lines.append(f"- {ds}")
+
+    brief = "\n".join(lines)[:_MAX_BRIEF_CHARS]
+    _last_brief_fingerprints[task.id] = fp
+    return brief
+
+
+def _inject_context_brief(db, task):
+    """Build and inject a role-specific context brief event. Idempotent."""
+    brief = _build_role_context_brief(db, task)
+    if not brief:
+        return  # fingerprint unchanged
+    _record_event(
+        db, task.id, "coordinator", "context",
+        summary=f"Role-specific context brief ({task.role or 'general'})",
+        content=brief,
+        metadata_json=_safe_json_dump({
+            "kind": "role_context_brief",
+            "role": task.role,
+            "fingerprint": _last_brief_fingerprints.get(task.id, ""),
+        }),
+    )
+
+
 # ── Loop ──────────────────────────────────────────────────────────────────────
 
 async def _coordinator_loop():
@@ -412,6 +637,8 @@ async def _tick():
 
         # Claim all eligible tasks
         for task in eligible:
+            # Inject role-specific context brief BEFORE claiming
+            _inject_context_brief(db, task)
             task.locked_by = task.current_owner
             task.locked_at = datetime.now(timezone.utc)
             task.attempt_count = (task.attempt_count or 0) + 1
@@ -434,6 +661,7 @@ async def _tick():
     # Dispatch all in parallel
     async def _process_one(task):
         """Claim, dispatch, and record result for a single task."""
+        global _tasks_processed
         adapter = _adapter_registry[task.current_owner]
         events = _load_events(task.id)
         role = task.role

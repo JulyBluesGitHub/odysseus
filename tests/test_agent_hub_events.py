@@ -462,6 +462,72 @@ class TestRoleDispatch:
         assert any(t["role"] == "verifier" for t in tasks)
 
 
+class TestContextBriefs:
+    """Tests for role-specific context briefs."""
+
+    def test_context_event_type_valid(self, client):
+        """context is a valid event type through the API."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Context test", "status": "draft",
+        })
+        task_id = r.json()["id"]
+        r2 = client.post(f"/api/agent-hub/tasks/{task_id}/events", json={
+            "actor": "coordinator", "event_type": "context",
+            "summary": "Test context event",
+        })
+        assert r2.status_code == 201
+
+    def test_context_brief_fingerprint_helper(self):
+        """_brief_fingerprint returns different values for different states."""
+        from src.agent_coordinator import _brief_fingerprint
+        # Create two mock tasks with different states
+        class MockTask:
+            pass
+        a = MockTask()
+        a.id = "a"; a.role = "diagnoser"; a.status = "queued"; a.depends_on = None
+        b = MockTask()
+        b.id = "b"; b.role = "diagnoser"; b.status = "queued"; b.depends_on = None
+        assert _brief_fingerprint(a) != _brief_fingerprint(b)
+        # Same task should produce same fingerprint
+        assert _brief_fingerprint(a) == _brief_fingerprint(a)
+
+    def test_context_excludes_self_from_similar_tasks(self, client):
+        """Similar tasks query excludes the task itself."""
+        from src.agent_coordinator import _brief_similar_tasks
+        from core.database import SessionLocal, AgentTask
+        import uuid as _uuid
+        db = SessionLocal()
+        try:
+            task = AgentTask(
+                id=str(_uuid.uuid4()), owner="testuser",
+                title="Fix authentication bug", status="queued", role="diagnoser",
+            )
+            db.add(task)
+            db.commit()
+            similar = _brief_similar_tasks(db, task)
+            ids = [s["id"] for s in similar]
+            assert task.id not in ids
+        finally:
+            db.close()
+
+    def test_context_brief_metadata_fields(self, client):
+        """Context event with metadata_json validates kind field."""
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Meta test", "status": "draft",
+        })
+        task_id = r.json()["id"]
+        import json
+        meta = json.dumps({"kind": "role_context_brief", "role": "verifier", "fingerprint": "abc123"})
+        r2 = client.post(f"/api/agent-hub/tasks/{task_id}/events", json={
+            "actor": "coordinator", "event_type": "context",
+            "summary": "Role-specific context brief (verifier)",
+            "content": "Context Brief — verifier\n\nTest content",
+            "metadata_json": meta,
+        })
+        assert r2.status_code == 201
+        assert "verifier" in r2.json()["summary"]
+
+
 class TestCreateTaskAction:
     """Tests for the create_task action type."""
 

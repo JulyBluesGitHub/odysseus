@@ -45,7 +45,7 @@ TRANSITIONS: dict[str, set[str]] = {
 }
 
 VALID_ACTORS = {"user", "hermes", "codex", "cursor", "coordinator"}
-VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock"}
+VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock", "context"}
 VALID_OWNERS = {"user", "hermes", "codex", "cursor"}
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_ROLES = {"diagnoser", "implementer", "verifier"}
