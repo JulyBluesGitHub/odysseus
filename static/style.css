@@ -21594,9 +21594,12 @@ body:not(.welcome-ready) #welcome-screen {
   text-underline-offset: 2px;
 }
 .ah-task-dep-badge {
-  font-size: 9px; font-weight: 600; padding: 0 5px; border-radius: 3px;
-  background: color-mix(in srgb, #f0a030 20%, transparent);
-  color: #f0a030; white-space: nowrap; line-height: 16px;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; border-radius: 8px;
+  font-size: 10px; font-weight: 600; line-height: 1;
+  border: 1px solid #f0a030; color: #f0a030;
+  white-space: nowrap; padding: 0 4px;
+  box-sizing: border-box;
 }
 /* Bindings button in header */
 .ah-bindings-btn {

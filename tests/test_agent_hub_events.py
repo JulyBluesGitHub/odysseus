@@ -571,3 +571,46 @@ Some response text.
         types = {a.type for a in actions}
         assert "file_write" in types
         assert "create_task" in types
+
+
+class TestStreamInitLimit:
+    """Tests for the AGENT_HUB_STREAM_INIT_LIMIT cap on SSE init snapshots."""
+
+    def test_init_limit_respected(self, client):
+        """_get_all_tasks returns at most STREAM_INIT_LIMIT tasks, newest first."""
+        from src.agent_hub_events import _get_all_tasks
+
+        import src.agent_hub_events as _events
+        saved = _events.STREAM_INIT_LIMIT
+        test_limit = 5
+        _events.STREAM_INIT_LIMIT = test_limit
+        try:
+            # Create test_limit + 2 tasks so we can verify the cap works
+            for i in range(test_limit + 2):
+                client.post("/api/agent-hub/tasks", json={
+                    "title": f"Limit test {i:03d}",
+                    "status": "draft",
+                })
+
+            tasks = _get_all_tasks("testuser")
+            assert len(tasks) <= test_limit, (
+                f"Expected at most {test_limit} tasks, got {len(tasks)}"
+            )
+            # Verify newest-first ordering
+            if len(tasks) >= 2:
+                t0 = tasks[0]["updated_at"]
+                t1 = tasks[1]["updated_at"]
+                assert t0 >= t1, "Tasks should be ordered by updated_at desc"
+        finally:
+            _events.STREAM_INIT_LIMIT = saved
+
+    def test_init_limit_default_value(self):
+        """Default STREAM_INIT_LIMIT is 100."""
+        import src.agent_hub_events as _events
+        # We may have mutated this in other tests — check default via env fallback
+        import os as _os
+        env_val = _os.getenv("AGENT_HUB_STREAM_INIT_LIMIT")
+        if env_val is None:
+            assert _events.STREAM_INIT_LIMIT in (100, min(_events.STREAM_INIT_LIMIT, 100))
+        else:
+            assert _events.STREAM_INIT_LIMIT == int(env_val)

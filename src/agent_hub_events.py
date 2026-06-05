@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Dict, Optional, Set
 
@@ -35,6 +36,9 @@ _KEEPALIVE_S = 30
 
 # Max queued events per client before dropping
 _QUEUE_MAXSIZE = 256
+
+# Max tasks sent in the init snapshot (env-configurable)
+STREAM_INIT_LIMIT = int(os.getenv("AGENT_HUB_STREAM_INIT_LIMIT", "100"))
 
 
 def _task_to_ssedict(t: AgentTask) -> dict:
@@ -125,13 +129,14 @@ def publish(owner: str, event: str, data: dict) -> None:
 
 
 def _get_all_tasks(owner: str) -> list[dict]:
-    """Fetch all tasks for an owner (used for init event)."""
+    """Fetch the most recent tasks for an owner (capped for init snapshot)."""
     db = SessionLocal()
     try:
         tasks = (
             db.query(AgentTask)
             .filter(AgentTask.owner == owner)
             .order_by(AgentTask.updated_at.desc())
+            .limit(STREAM_INIT_LIMIT)
             .all()
         )
         return [_task_to_ssedict(t) for t in tasks]

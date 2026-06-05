@@ -207,6 +207,11 @@ function _startSSE() {
   _eventSource.addEventListener('task_updated', (e) => {
     try {
       const t = JSON.parse(e.data);
+      const terminalStatuses = ['done', 'blocked', 'cancelled'];
+      const old = _taskMap.get(t.id);
+      if (old && old.status !== t.status && terminalStatuses.includes(t.status)) {
+        _showToast(`Task ${t.status}: ${t.title || t.id.slice(0, 8)}`);
+      }
       _taskMap.set(t.id, t);
       _renderFromCache();
       // If this is the selected task, update the detail view surgically
@@ -403,7 +408,7 @@ function _renderTaskList(tasks) {
         </div>
         <div class="ah-task-item-meta">
           ${t.role ? `<span class="ah-task-role-badge">${_esc(t.role)}</span>` : ''}
-          ${t.depends_on && t.depends_on.length ? `<span class="ah-task-dep-badge" title="Waiting on ${t.depends_on.length} dependencies">⏳${t.depends_on.length}</span>` : ''}
+          ${t.depends_on && t.depends_on.length ? `<span class="ah-task-dep-badge" title="Waiting on ${t.depends_on.length} dependencies">${t.depends_on.length}</span>` : ''}
           <span class="ah-task-owner">${t.current_owner || 'unassigned'}</span>
           <span class="ah-task-status">${t.status}</span>
           <span class="ah-task-timer ${t.started_at ? '' : 'ah-task-timer--hidden'}"></span>
