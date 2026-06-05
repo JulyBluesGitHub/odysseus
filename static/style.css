@@ -21451,7 +21451,8 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-task-item:hover { background: color-mix(in srgb, var(--fg) 3%, transparent); }
 .ah-task-item--active { background: color-mix(in srgb, var(--fg) 6%, transparent); border-left: 3px solid var(--accent, #5b8abf); }
 .ah-task-item-header { display: flex; align-items: center; gap: 6px; font-weight: 500; }
-.ah-task-item-meta { display: flex; gap: 8px; margin-top: 3px; font-size: 10px; opacity: 0.6; }
+.ah-task-item-meta { display: flex; gap: 8px; margin-top: 3px; font-size: 10px; opacity: 0.6; align-items: center; }
+.ah-task-duration { font-size: 9px; opacity: 0.5; color: var(--accent, #5b8abf); white-space: nowrap; }
 .ah-task-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ah-task-delete-btn {
   display: none; margin-left: auto; background: none; border: none;

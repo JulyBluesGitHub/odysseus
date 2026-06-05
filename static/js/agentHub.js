@@ -491,6 +491,7 @@ function _renderTaskList(tasks) {
           ${t.depends_on && t.depends_on.length ? `<span class="ah-task-dep-badge" title="Waiting on ${t.depends_on.length} dependencies">${t.depends_on.length}</span>` : ''}
           <span class="ah-task-owner">${t.current_owner || 'unassigned'}</span>
           <span class="ah-task-status">${t.status}</span>
+          ${_formatDuration(t) ? `<span class="ah-task-duration">${_formatDuration(t)}</span>` : ''}
           <span class="ah-task-timer ${t.started_at ? '' : 'ah-task-timer--hidden'}"></span>
         </div>
       </div>
@@ -1633,6 +1634,23 @@ function _collapseEvents(events) {
     }
   }
   return out;
+}
+
+function _formatDuration(task) {
+  if (!task.started_at || !task.updated_at) return null;
+  const terminal = ['done', 'cancelled', 'blocked'];
+  if (!terminal.includes(task.status)) return null;
+  const start = new Date(task.started_at);
+  const end = new Date(task.updated_at);
+  const ms = end - start;
+  if (ms < 0) return null;
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return sec + 's';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + 'm';
+  const hr = Math.floor(min / 60);
+  const rm = min % 60;
+  return hr + 'h ' + rm + 'm';
 }
 
 function _showToast(msg) {
