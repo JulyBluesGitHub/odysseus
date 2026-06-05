@@ -21451,6 +21451,49 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-stat--warn { color: #f0a030; }
 .ah-stat--good { color: #44aa44; }
 .ah-stat--bad { color: #cc4444; }
+.ah-saved-filters {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 3px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  font-size: 10px;
+}
+.ah-saved-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8abf) 60%, transparent);
+  color: var(--accent, #5b8abf);
+  cursor: pointer;
+  line-height: 1.4;
+  font-size: 10px;
+}
+.ah-saved-filter-chip:hover { background: color-mix(in srgb, var(--accent, #5b8abf) 10%, transparent); }
+.ah-saved-filter-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.4;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  line-height: 1;
+}
+.ah-saved-filter-remove:hover { opacity: 1; }
+.ah-saved-filter-save-btn {
+  background: none;
+  border: 1px dashed var(--border);
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.ah-saved-filter-save-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ah-list-toolbar { padding: 8px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 4px; }
 .ah-filter { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 110px; }
 .ah-search-input { max-width: 160px; flex-grow: 1; }

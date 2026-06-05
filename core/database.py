@@ -1690,6 +1690,7 @@ def init_db():
     _migrate_add_agent_task_priority_column()
     _migrate_add_agent_task_due_date_column()
     _migrate_add_workflow_templates_table()
+    _migrate_agent_search_fts()
 
 
 def _migrate_add_agent_task_chain_column():
@@ -1940,6 +1941,90 @@ def _migrate_add_workflow_templates_table():
         conn.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"workflow_templates migration failed: {e}")
+def _migrate_agent_search_fts():
+    """Create FTS5 search index over agent tasks and message events."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        # Create FTS5 virtual table
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS agent_search_fts USING fts5(
+                task_id UNINDEXED,
+                searchable_text,
+                tokenize='porter unicode61'
+            )
+        """)
+        # Trigger: task insert
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_search_fts_task_insert
+            AFTER INSERT ON agent_tasks BEGIN
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                VALUES (NEW.id, NEW.title || ' ' || COALESCE(NEW.objective, ''));
+            END
+        """)
+        # Trigger: task update
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_search_fts_task_update
+            AFTER UPDATE ON agent_tasks BEGIN
+                DELETE FROM agent_search_fts WHERE task_id = NEW.id;
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                VALUES (NEW.id, NEW.title || ' ' || COALESCE(NEW.objective, ''));
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                SELECT NEW.id, COALESCE(content, '') || ' ' || COALESCE(summary, '')
+                FROM agent_events
+                WHERE task_id = NEW.id AND event_type = 'message';
+            END
+        """)
+        # Trigger: task delete
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_search_fts_task_delete
+            AFTER DELETE ON agent_tasks BEGIN
+                DELETE FROM agent_search_fts WHERE task_id = OLD.id;
+            END
+        """)
+        # Trigger: event insert (message type only)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_search_fts_event_insert
+            AFTER INSERT ON agent_events WHEN NEW.event_type = 'message' BEGIN
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                VALUES (NEW.task_id, COALESCE(NEW.content, '') || ' ' || COALESCE(NEW.summary, ''));
+            END
+        """)
+        # Trigger: event delete
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_search_fts_event_delete
+            AFTER DELETE ON agent_events WHEN OLD.event_type = 'message' BEGIN
+                DELETE FROM agent_search_fts WHERE task_id = OLD.task_id;
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                SELECT OLD.task_id, COALESCE(content, '') || ' ' || COALESCE(summary, '')
+                FROM agent_events
+                WHERE task_id = OLD.task_id AND event_type = 'message';
+                INSERT INTO agent_search_fts(task_id, searchable_text)
+                SELECT id, title || ' ' || COALESCE(objective, '')
+                FROM agent_tasks
+                WHERE id = OLD.task_id;
+            END
+        """)
+        # Backfill existing data
+        conn.execute("""
+            INSERT OR IGNORE INTO agent_search_fts(task_id, searchable_text)
+            SELECT id, title || ' ' || COALESCE(objective, '')
+            FROM agent_tasks
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO agent_search_fts(task_id, searchable_text)
+            SELECT task_id, COALESCE(content, '') || ' ' || COALESCE(summary, '')
+            FROM agent_events
+            WHERE event_type = 'message'
+        """)
+        conn.commit()
+        conn.close()
+        logging.getLogger(__name__).info("Migrated: FTS5 search index for agent tasks")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"agent_search_fts migration failed: {e}")
 
 
 def _migrate_add_email_smtp_security():

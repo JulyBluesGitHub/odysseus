@@ -97,6 +97,7 @@ function _getModal() {
       <div class="ah-body">
         <div class="ah-left-pane" id="ah-task-list">
           <div class="ah-stats-row" id="ah-stats-row"></div>
+          <div class="ah-saved-filters" id="ah-saved-filters"></div>
           <div class="ah-list-toolbar">
             <input type="text" class="ah-filter ah-search-input" id="ah-search-input" placeholder="Search tasks…">
             <button class="ah-btn ah-btn-primary" id="ah-new-task-btn">+ New Task</button>
@@ -196,12 +197,19 @@ function _getModal() {
     if (e.key === '/' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); const s = document.getElementById('ah-search-input'); if (s) s.focus(); return; }
   });
 
-  // Debounced keyword search
+  // Debounced keyword search — backend fetch when query present, client-side otherwise
   const searchInput = modal.querySelector('#ah-search-input');
   let _searchTimer = null;
   searchInput.addEventListener('input', () => {
     clearTimeout(_searchTimer);
-    _searchTimer = setTimeout(() => _renderFromCache(), 300);
+    _searchTimer = setTimeout(() => {
+      const q = searchInput.value.trim();
+      if (q) {
+        _fetchAndRender();  // hit backend with ?q= for FTS5 event-content search
+      } else {
+        _renderFromCache();
+      }
+    }, 300);
   });
 
   // ── Splitter drag ──
@@ -328,8 +336,11 @@ function _stopFallbackPoll() {
 
 // ── Data fetching (manual refresh + fallback) ─────────────────────────────────
 
-async function _fetchTasks() {
-  const url = `${API_BASE}/api/agent-hub/tasks`;
+async function _fetchTasks(query) {
+  let url = `${API_BASE}/api/agent-hub/tasks`;
+  if (query) {
+    url += `?q=${encodeURIComponent(query)}`;
+  }
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -370,10 +381,13 @@ async function _fetchStatus() {
 // ── Client-side filtering + rendering ─────────────────────────────────────────
 
 async function _fetchAndRender() {
-  await _fetchTasks();
+  const searchEl = document.getElementById('ah-search-input');
+  const q = searchEl?.value.trim() || null;
+  await _fetchTasks(q);
   const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
   _renderStatsBar();
+  _renderFilterChips();
   _renderCoordinatorStatus();
   _updateBadge(tasks);
   if (_selectedTaskId) {
@@ -445,6 +459,7 @@ function _renderFromCache() {
   const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
   _renderStatsBar();
+  _renderFilterChips();
   _updateBadge(tasks);
   _tickAllListTimers();  // populate fresh timer spans immediately
   _updateActionBar();     // show/hide batch bar based on selection
@@ -500,6 +515,115 @@ function _renderStatsBar() {
     <span class="ah-stat ah-stat--good">Terminal success ${_formatPct(stats.terminalSuccessRate)}</span>
     ${ownersHtml}
   `;
+}
+
+// ── Saved filters (localStorage) ──────────────────────────────────────────────
+
+const SAVED_FILTERS_KEY = 'ah_saved_filters';
+const MAX_SAVED_FILTERS = 20;
+
+function _getCurrentFilterConfig() {
+  const statusEl = document.getElementById('ah-status-filter');
+  const ownerEl = document.getElementById('ah-owner-filter');
+  const tagEl = document.getElementById('ah-tag-filter');
+  const priorityEl = document.getElementById('ah-priority-filter');
+  const searchEl = document.getElementById('ah-search-input');
+  const sortEl = document.getElementById('ah-sort');
+  return {
+    status: statusEl?.value || '',
+    owner: ownerEl?.value || '',
+    tag: tagEl?.value.trim() || '',
+    priority: priorityEl?.value || '',
+    overdue: _overdueOn,
+    q: searchEl?.value.trim() || '',
+    sort: sortEl?.value || 'updated',
+  };
+}
+
+function _loadSavedFilters() {
+  try { return JSON.parse(localStorage.getItem(SAVED_FILTERS_KEY) || '[]'); }
+  catch (_) { return []; }
+}
+
+function _saveFilter(name) {
+  const filters = _loadSavedFilters();
+  const idx = filters.findIndex(f => f.name.toLowerCase() === name.toLowerCase());
+  if (idx !== -1) filters.splice(idx, 1);
+  filters.push({ name, config: _getCurrentFilterConfig() });
+  if (filters.length > MAX_SAVED_FILTERS) filters.shift();
+  localStorage.setItem(SAVED_FILTERS_KEY, JSON.stringify(filters));
+  _renderFilterChips();
+}
+
+function _deleteFilter(name) {
+  const filters = _loadSavedFilters().filter(f => f.name !== name);
+  localStorage.setItem(SAVED_FILTERS_KEY, JSON.stringify(filters));
+  _renderFilterChips();
+}
+
+function _applyFilter(config) {
+  const statusEl = document.getElementById('ah-status-filter');
+  const ownerEl = document.getElementById('ah-owner-filter');
+  const tagEl = document.getElementById('ah-tag-filter');
+  const priorityEl = document.getElementById('ah-priority-filter');
+  const searchEl = document.getElementById('ah-search-input');
+  const sortEl = document.getElementById('ah-sort');
+  const overdueBtn = document.getElementById('ah-overdue-filter');
+
+  if (statusEl) statusEl.value = config.status || '';
+  if (ownerEl) ownerEl.value = config.owner || '';
+  if (tagEl) tagEl.value = config.tag || '';
+  if (priorityEl) priorityEl.value = config.priority || '';
+  if (sortEl) sortEl.value = config.sort || 'updated';
+  if (searchEl) searchEl.value = config.q || '';
+  _overdueOn = !!config.overdue;
+  if (overdueBtn) overdueBtn.classList.toggle('ah-overdue-toggle--on', _overdueOn);
+
+  if (config.q) {
+    _fetchAndRender();
+  } else {
+    _renderFromCache();
+  }
+}
+
+function _renderFilterChips() {
+  const el = document.getElementById('ah-saved-filters');
+  if (!el) return;
+  const filters = _loadSavedFilters();
+  if (!filters.length) {
+    el.innerHTML = '';
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'flex';
+  el.innerHTML = filters.map(f =>
+    `<span class="ah-saved-filter-chip" data-filter-name="${_esc(f.name)}">${_esc(f.name)} <button class="ah-saved-filter-remove" data-filter-name="${_esc(f.name)}">x</button></span>`
+  ).join('') +
+    '<button class="ah-saved-filter-save-btn" id="ah-save-filter-btn" title="Save current filters">+ Save</button>';
+
+  el.querySelectorAll('.ah-saved-filter-chip').forEach(chip => {
+    chip.addEventListener('click', (e) => {
+      if (e.target.classList.contains('ah-saved-filter-remove')) return;
+      const name = chip.dataset.filterName;
+      const filter = _loadSavedFilters().find(f => f.name === name);
+      if (filter) _applyFilter(filter.config);
+    });
+  });
+
+  el.querySelectorAll('.ah-saved-filter-remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _deleteFilter(btn.dataset.filterName);
+    });
+  });
+
+  const saveBtn = el.querySelector('#ah-save-filter-btn');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', () => {
+      const name = prompt('Filter name:');
+      if (name && name.trim()) _saveFilter(name.trim());
+    });
+  }
 }
 
 function _renderTaskList(tasks) {

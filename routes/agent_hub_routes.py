@@ -544,11 +544,36 @@ def setup_agent_hub_routes() -> APIRouter:
                     AgentTask.status.notin_(["done", "cancelled"]),
                 )
             if q:
-                pattern = f"%{q}%"
-                qobj = qobj.filter(or_(
-                    AgentTask.title.ilike(pattern),
-                    AgentTask.objective.ilike(pattern),
-                ))
+                # FTS5 full-text search across title + objective + message events.
+                # Each word gets prefix matching: "migr" matches "migration".
+                # Falls back to LIKE if FTS5 table doesn't exist yet (pre-migration).
+                try:
+                    import re
+                    # Split into words, strip FTS5 operators, escape double-quotes
+                    words = re.findall(r'[a-zA-Z0-9_]+', q.lower())
+                    if words:
+                        terms = [f'"{w}"*' for w in words]
+                        fts_query = " ".join(terms)
+                        fts_ids = [
+                            row[0] for row in
+                            db.execute(
+                                text("SELECT task_id FROM agent_search_fts WHERE agent_search_fts MATCH :q"),
+                                {"q": fts_query}
+                            ).fetchall()
+                        ]
+                        if fts_ids:
+                            qobj = qobj.filter(AgentTask.id.in_(fts_ids))
+                        else:
+                            # No FTS5 matches — return empty
+                            qobj = qobj.filter(AgentTask.id == "__none__")
+                    # else: no valid words, return empty
+                except Exception:
+                    # FTS5 table not yet created — fall back to LIKE
+                    pattern = f"%{q}%"
+                    qobj = qobj.filter(or_(
+                        AgentTask.title.ilike(pattern),
+                        AgentTask.objective.ilike(pattern),
+                    ))
             tasks = qobj.order_by(AgentTask.updated_at.desc()).all()
             return {"tasks": [_task_to_dict(t) for t in tasks]}
         finally:
