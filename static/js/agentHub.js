@@ -32,6 +32,7 @@ let _fallbackPoll = null;            // polling fallback when SSE errors
 let _listTimerInterval = null;       // 1s tick for all visible row timers
 let _detailTimerSince = null;        // ISO timestamp for selected task's running timer
 let _newTags = [];
+let _overdueOn = false;               // overdue filter toggle
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -104,7 +105,7 @@ function _getModal() {
               <option value="medium">Medium</option>
               <option value="low">Low</option>
             </select>
-            <label class="ah-overdue-filter"><input type="checkbox" id="ah-overdue-filter"> Overdue only</label>
+            <button class="ah-filter ah-overdue-toggle" id="ah-overdue-filter">Overdue</button>
             <select class="ah-filter" id="ah-status-filter">
               <option value="">All Statuses</option>
               <option value="draft">Draft</option>
@@ -176,7 +177,7 @@ function _getModal() {
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-tag-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-priority-filter').addEventListener('change', () => _renderFromCache());
-  modal.querySelector('#ah-overdue-filter').addEventListener('change', () => _renderFromCache());
+  modal.querySelector('#ah-overdue-filter').addEventListener('click', () => { _overdueOn = !_overdueOn; const btn = document.getElementById('ah-overdue-filter'); if (btn) btn.classList.toggle('ah-overdue-toggle--on', _overdueOn); _renderFromCache(); });
 
   // Sort dropdown
   modal.querySelector('#ah-sort').addEventListener('change', () => _renderFromCache());
@@ -324,20 +325,18 @@ async function _fetchTasks() {
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
   const priorityEl = document.getElementById('ah-priority-filter');
-  const overdueEl = document.getElementById('ah-overdue-filter');
   const params = new URLSearchParams();
   const status = statusEl?.value;
   const owner = ownerEl?.value;
   const search = searchEl?.value.trim();
   const tag = tagEl?.value.trim();
   const priority = priorityEl?.value;
-  const overdue = overdueEl?.checked;
   if (status) params.set('status', status);
   if (owner) params.set('owner', owner);
   if (search) params.set('q', search);
   if (tag) params.set('tag', tag);
   if (priority) params.set('priority', priority);
-  if (overdue) params.set('overdue', 'true');
+  if (_overdueOn) params.set('overdue', 'true');
   const url = `${API_BASE}/api/agent-hub/tasks${params.toString() ? '?' + params : ''}`;
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
@@ -398,13 +397,11 @@ function _getFilteredTasks() {
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
   const priorityEl = document.getElementById('ah-priority-filter');
-  const overdueEl = document.getElementById('ah-overdue-filter');
   const status = statusEl?.value || '';
   const owner = ownerEl?.value || '';
   const search = (searchEl?.value || '').trim().toLowerCase();
   const tag = (tagEl?.value || '').trim().toLowerCase();
   const priority = priorityEl?.value || '';
-  const overdue = overdueEl?.checked || false;
 
   let tasks = Array.from(_taskMap.values());
 
@@ -417,7 +414,7 @@ function _getFilteredTasks() {
   if (priority) {
     tasks = tasks.filter(t => (t.priority || 'medium') === priority);
   }
-  if (overdue) {
+  if (_overdueOn) {
     tasks = tasks.filter(t => _isTaskOverdue(t));
   }
   if (search) {
