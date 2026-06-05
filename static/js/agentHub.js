@@ -503,10 +503,16 @@ function _renderTaskDetail(task) {
     }
   }
 
-  const timeline = events.map(e => {
+  // Build timeline — collapse noisy content behind toggles
+  const collapsed = _collapseEvents(events);
+
+  const timeline = collapsed.map(e => {
     const actorClass = _actorClass(e.actor);
     const typeLabel = _eventTypeLabel(e.event_type);
+    const hasContent = e.content && e.content.length > 0;
+    const eventId = 'evt-' + Math.random().toString(36).slice(2, 8);
     let metaBlock = '';
+
     if (e.metadata_json) {
       try {
         const meta = JSON.parse(e.metadata_json);
@@ -521,15 +527,28 @@ function _renderTaskDetail(task) {
         }
       } catch (_) {}
     }
+
+    // Message events: summary visible, content behind toggle
+    // Error events: always show full content
+    // Context events: collapsed to one line
+    // Status/lock events: summary only
+    const showContent = e.event_type === 'error' || e._showContent;
+    const contentToggle = (e.event_type === 'message' && hasContent && !showContent)
+      ? `<button class="ah-event-toggle" data-target="${eventId}" title="Show response">+</button>`
+      : '';
+
     return `
       <div class="ah-event ah-event--${e.event_type}">
         <div class="ah-event-header">
           <span class="ah-event-actor ah-actor--${actorClass}">${_esc(e.actor)}</span>
           <span class="ah-event-type-label">${typeLabel}</span>
           <span class="ah-event-time">${_formatTime(e.created_at)}</span>
+          ${contentToggle}
         </div>
         ${e.summary ? `<div class="ah-event-summary">${_esc(e.summary)}</div>` : ''}
-        ${e.content ? `<div class="ah-event-content">${_esc(e.content)}</div>` : ''}
+        ${showContent && hasContent ? `<div class="ah-event-content" id="${eventId}">${_esc(e.content)}</div>`
+          : hasContent ? `<div class="ah-event-content ah-event-content--collapsed" id="${eventId}" style="display:none">${_esc(e.content)}</div>`
+          : ''}
         ${metaBlock}
       </div>
     `;
@@ -617,6 +636,17 @@ function _renderTaskDetail(task) {
       }).catch(() => {});
     });
   }
+
+  // Wire content toggle buttons (show/hide agent responses)
+  container.querySelectorAll('.ah-event-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = document.getElementById(btn.dataset.target);
+      if (!target) return;
+      const hidden = target.style.display === 'none';
+      target.style.display = hidden ? 'block' : 'none';
+      btn.textContent = hidden ? '\u2212' : '+';
+    });
+  });
 
   // Bind detail actions
   container.querySelectorAll('.ah-tag-remove').forEach(btn => {
@@ -1512,6 +1542,30 @@ async function _executeBatchAction(action) {
   } catch (err) {
     _showToast(`Batch error: ${err.message}`);
   }
+}
+
+// ── Event collapsing ────────────────────────────────────────────────────
+
+function _collapseEvents(events) {
+  // Deduplicate repetitive status changes (role resolution loops)
+  // and collapse context events to summary-only.
+  const out = [];
+  let lastKey = '';
+  for (const e of events) {
+    if (e.event_type === 'status_change' && e.summary && e.summary.includes('Resolved role')) {
+      if (e.summary === lastKey) continue;
+      lastKey = e.summary;
+    } else {
+      lastKey = '';
+    }
+    // Context events: hide full content, show summary only
+    if (e.event_type === 'context') {
+      out.push({ ...e, content: null, _showContent: false });
+    } else {
+      out.push(e);
+    }
+  }
+  return out;
 }
 
 function _showToast(msg) {

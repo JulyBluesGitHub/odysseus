@@ -21498,6 +21498,15 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-chain-sep { opacity: 0.2; margin: 0 4px; font-size: 11px; }
 .ah-timeline { border-top: 1px solid var(--border); padding-top: 8px; }
 .ah-timeline-title { margin: 0 0 6px; font-size: 12px; opacity: 0.6; }
+.ah-event-content--collapsed { display: none; }
+.ah-event-toggle {
+  background: none; border: 1px solid var(--border, #333);
+  color: var(--fg, #ccc); cursor: pointer;
+  font-size: 10px; line-height: 1; padding: 0 4px;
+  border-radius: 3px; opacity: 0.5; margin-left: auto;
+}
+.ah-event-toggle:hover { opacity: 1; }
+
 .ah-similar-tasks { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 12px; }
 .ah-similar-title { font-size: 11px; text-transform: uppercase; opacity: 0.5; margin-bottom: 6px; }
 .ah-similar-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; font-size: 12px; opacity: 0.8; }
