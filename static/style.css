@@ -21438,6 +21438,7 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-list-toolbar { padding: 8px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 4px; }
 .ah-filter { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 110px; }
 .ah-search-input { max-width: 160px; flex-grow: 1; }
+.ah-priority-filter { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 110px; }
 .ah-tag-input { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 120px; }
 .ah-tag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
 .ah-tag-chip { display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--accent, #5b8abf); color: var(--accent, #5b8abf); font-size: 10px; line-height: 1.4; }
@@ -21459,13 +21460,25 @@ body:not(.welcome-ready) #welcome-screen {
 }
 .ah-task-item:hover .ah-task-delete-btn { display: block; }
 .ah-task-delete-btn:hover { opacity: 0.7; color: #cc4444; }
+/* Quick actions — on hover next to delete */
+.ah-task-actions { display: inline-flex; gap: 2px; margin-left: auto; align-items: center; }
+.ah-quick-action { background: none; border: 1px solid var(--border, #333); cursor: pointer; opacity: 0; font-size: 10px; padding: 0 4px; border-radius: 3px; font-family: inherit; transition: opacity 0.1s; }
+.ah-task-item:hover .ah-quick-action { opacity: 0.6; }
+.ah-quick-action:hover { opacity: 1 !important; }
+.ah-quick-action--cancel { color: #f0a030; }
+.ah-quick-action--retry { color: #5b8abf; }
+.ah-sort { max-width: 80px; }
 .ah-status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.ah-priority-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; flex-shrink: 0; }
+.ah-priority--high { background: #cc4444; }
+.ah-priority--medium { background: #f0a030; }
+.ah-priority--low { background: #5b8abf; }
 .ah-empty { padding: 20px; text-align: center; opacity: 0.4; font-size: 12px; }
 .ah-empty-detail { padding: 40px 20px; }
 .ah-header { display: flex; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); gap: 8px; }
 .ah-header-status { font-size: 11px; opacity: 0.6; margin-left: auto; }
 .ah-status-live { color: #44aa44; }
-.ah-status-idle { color: #888; }
+.ah-status-idle {
 .ah-refresh-btn { background: none; border: none; color: var(--fg); opacity: 0.5; cursor: pointer; font-size: 14px; padding: 2px 4px; }
 .ah-refresh-btn:hover { opacity: 1; }
 .ah-detail-header { margin-bottom: 10px; }

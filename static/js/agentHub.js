@@ -115,6 +115,11 @@ function _getModal() {
               <option value="codex">Codex</option>
               <option value="cursor">Cursor</option>
             </select>
+            <select class="ah-filter ah-sort" id="ah-sort">
+              <option value="updated">Latest</option>
+              <option value="created">Created</option>
+              <option value="priority">Priority</option>
+            </select>
           </div>
           <div class="ah-task-items" id="ah-task-items">
             <div class="ah-empty">Loading tasks…</div>
@@ -163,6 +168,9 @@ function _getModal() {
   modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-tag-filter').addEventListener('change', () => _renderFromCache());
+
+  // Sort dropdown
+  modal.querySelector('#ah-sort').addEventListener('change', () => _renderFromCache());
 
   // Batch action bar buttons
   modal.querySelector('#ah-batch-cancel').addEventListener('click', () => _executeBatchAction('cancel'));
@@ -397,11 +405,21 @@ function _getFilteredTasks() {
     tasks = tasks.filter(t => (t.tags || []).some(item => (item || '').toLowerCase() === tag));
   }
 
-  // Sort by updated_at descending
+  // Sort by selected criterion
+  const sortEl = document.getElementById('ah-sort');
+  const sortBy = sortEl?.value || 'updated';
+  const PRIORITY_ORDER = { high: 0, medium: 1, low: 2 };
   tasks.sort((a, b) => {
-    const da = a.updated_at ? new Date(a.updated_at) : 0;
-    const db = b.updated_at ? new Date(b.updated_at) : 0;
-    return db - da;
+    if (sortBy === 'created') {
+      return new Date(b.created_at || 0) - new Date(a.created_at || 0);
+    }
+    if (sortBy === 'priority') {
+      const pa = PRIORITY_ORDER[a.priority] ?? 1;
+      const pb = PRIORITY_ORDER[b.priority] ?? 1;
+      if (pa !== pb) return pa - pb;
+      // Fallback to updated_at for same priority
+    }
+    return new Date(b.updated_at || 0) - new Date(a.updated_at || 0);
   });
 
   return tasks;
@@ -445,7 +463,11 @@ function _renderTaskList(tasks) {
           ${statusDot}
           <span class="ah-task-title">${_esc(t.title)}</span>
           ${tagsHtml}
-          <button class="ah-task-delete-btn" data-delete-id="${t.id}" title="Delete task">×</button>
+          <div class="ah-task-actions">
+            ${(t.status === 'queued' || t.status === 'running') ? `<button class="ah-quick-action ah-quick-action--cancel" data-action="cancel" data-id="${t.id}" title="Cancel">Cancel</button>` : ''}
+            ${t.status === 'blocked' ? `<button class="ah-quick-action ah-quick-action--retry" data-action="retry" data-id="${t.id}" title="Retry">Retry</button>` : ''}
+            <button class="ah-task-delete-btn" data-delete-id="${t.id}" title="Delete task">×</button>
+          </div>
         </div>
         <div class="ah-task-item-meta">
           ${t.role ? `<span class="ah-task-role-badge">${_esc(t.role)}</span>` : ''}
@@ -464,6 +486,16 @@ function _renderTaskList(tasks) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       _deleteTask(btn.dataset.deleteId);
+    });
+  });
+  // Quick action buttons (Cancel/Retry on hover)
+  container.querySelectorAll('.ah-quick-action').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.action;
+      const id = btn.dataset.id;
+      if (action === 'cancel') _quickCancel(id);
+      else if (action === 'retry') _quickRetry(id);
     });
   });
   // Select-all checkbox
@@ -1517,6 +1549,23 @@ function _updateActionBar() {
 async function _executeBatchAction(action) {
   if (_selected.size === 0) return;
   const taskIds = Array.from(_selected);
+  await _doBatchAction(action, taskIds);
+  _selected.clear();
+  _updateActionBar();
+  _fetchAndRender();
+}
+
+async function _quickCancel(taskId) {
+  await _doBatchAction('cancel', [taskId]);
+  _fetchAndRender();
+}
+
+async function _quickRetry(taskId) {
+  await _doBatchAction('retry', [taskId]);
+  _fetchAndRender();
+}
+
+async function _doBatchAction(action, taskIds) {
   try {
     const r = await fetch(`${API_BASE}/api/agent-hub/tasks/batch`, {
       method: 'POST',
@@ -1527,14 +1576,9 @@ async function _executeBatchAction(action) {
     const data = await r.json();
     if (data.ok) {
       _showToast(`${data.results.succeeded} task(s) ${action}d`);
-      _selected.clear();
-      _updateActionBar();
-      // Re-fetch from server to get authoritative state
-      _fetchAndRender();
     } else {
       _showToast('Batch operation failed');
     }
-    // If any failures, show them
     if (data.results && data.results.failed && data.results.failed.length) {
       const msgs = data.results.failed.map(f => `${f.id.slice(0,8)}: ${f.error}`).join('; ');
       _showToast(`Failed: ${msgs}`);
