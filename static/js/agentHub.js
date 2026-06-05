@@ -33,6 +33,7 @@ let _listTimerInterval = null;       // 1s tick for all visible row timers
 let _detailTimerSince = null;        // ISO timestamp for selected task's running timer
 let _newTags = [];
 let _overdueOn = false;               // overdue filter toggle
+let _timelineExpanded = new Set();     // Stable event/timeline item IDs expanded by the user
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -95,6 +96,7 @@ function _getModal() {
       </div>
       <div class="ah-body">
         <div class="ah-left-pane" id="ah-task-list">
+          <div class="ah-stats-row" id="ah-stats-row"></div>
           <div class="ah-list-toolbar">
             <input type="text" class="ah-filter ah-search-input" id="ah-search-input" placeholder="Search tasks…">
             <button class="ah-btn ah-btn-primary" id="ah-new-task-btn">+ New Task</button>
@@ -327,24 +329,7 @@ function _stopFallbackPoll() {
 // ── Data fetching (manual refresh + fallback) ─────────────────────────────────
 
 async function _fetchTasks() {
-  const statusEl = document.getElementById('ah-status-filter');
-  const ownerEl = document.getElementById('ah-owner-filter');
-  const searchEl = document.getElementById('ah-search-input');
-  const tagEl = document.getElementById('ah-tag-filter');
-  const priorityEl = document.getElementById('ah-priority-filter');
-  const params = new URLSearchParams();
-  const status = statusEl?.value;
-  const owner = ownerEl?.value;
-  const search = searchEl?.value.trim();
-  const tag = tagEl?.value.trim();
-  const priority = priorityEl?.value;
-  if (status) params.set('status', status);
-  if (owner) params.set('owner', owner);
-  if (search) params.set('q', search);
-  if (tag) params.set('tag', tag);
-  if (priority) params.set('priority', priority);
-  if (_overdueOn) params.set('overdue', 'true');
-  const url = `${API_BASE}/api/agent-hub/tasks${params.toString() ? '?' + params : ''}`;
+  const url = `${API_BASE}/api/agent-hub/tasks`;
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -385,8 +370,10 @@ async function _fetchStatus() {
 // ── Client-side filtering + rendering ─────────────────────────────────────────
 
 async function _fetchAndRender() {
-  const tasks = await _fetchTasks();
+  await _fetchTasks();
+  const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
+  _renderStatsBar();
   _renderCoordinatorStatus();
   _updateBadge(tasks);
   if (_selectedTaskId) {
@@ -457,9 +444,62 @@ function _getFilteredTasks() {
 function _renderFromCache() {
   const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
+  _renderStatsBar();
   _updateBadge(tasks);
   _tickAllListTimers();  // populate fresh timer spans immediately
   _updateActionBar();     // show/hide batch bar based on selection
+}
+
+function _buildDashboardStats() {
+  const tasks = Array.from(_taskMap.values());
+  const statuses = {
+    draft: 0, queued: 0, running: 0, waiting_for_approval: 0,
+    blocked: 0, done: 0, cancelled: 0,
+  };
+  const byOwner = {};
+  for (const task of tasks) {
+    const status = task.status || 'draft';
+    statuses[status] = (statuses[status] || 0) + 1;
+    const owner = task.current_owner || 'unassigned';
+    byOwner[owner] = (byOwner[owner] || 0) + 1;
+  }
+  const total = tasks.length;
+  const terminal = statuses.done + statuses.cancelled + statuses.blocked;
+  return {
+    total,
+    statuses,
+    byOwner,
+    doneRate: total ? statuses.done / total : 0,
+    terminalSuccessRate: terminal ? statuses.done / terminal : 0,
+  };
+}
+
+function _formatPct(value) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function _renderStatsBar() {
+  const el = document.getElementById('ah-stats-row');
+  if (!el) return;
+  const stats = _buildDashboardStats();
+  const owners = Object.entries(stats.byOwner)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 4)
+    .map(([owner, count]) => `${_esc(owner)} ${count}`)
+    .join(', ');
+  const ownersHtml = owners
+    ? `<span class="ah-stat ah-stat--neutral">By owner: ${owners}</span>`
+    : '';
+  el.innerHTML = `
+    <span class="ah-stat ah-stat--neutral">Total ${stats.total}</span>
+    <span class="ah-stat ah-stat--warn">Running ${stats.statuses.running}</span>
+    <span class="ah-stat ah-stat--info">Queued ${stats.statuses.queued}</span>
+    <span class="ah-stat ah-stat--good">Done ${stats.statuses.done}</span>
+    <span class="ah-stat ah-stat--bad">Blocked ${stats.statuses.blocked}</span>
+    <span class="ah-stat ah-stat--neutral">Done rate ${_formatPct(stats.doneRate)}</span>
+    <span class="ah-stat ah-stat--good">Terminal success ${_formatPct(stats.terminalSuccessRate)}</span>
+    ${ownersHtml}
+  `;
 }
 
 function _renderTaskList(tasks) {
@@ -590,56 +630,9 @@ function _renderTaskDetail(task) {
     }
   }
 
-  // Build timeline — collapse noisy content behind toggles
-  const collapsed = _collapseEvents(events);
-
-  const timeline = collapsed.map(e => {
-    const actorClass = _actorClass(e.actor);
-    const typeLabel = _eventTypeLabel(e.event_type);
-    const hasContent = e.content && e.content.length > 0;
-    const eventId = 'evt-' + Math.random().toString(36).slice(2, 8);
-    let metaBlock = '';
-
-    if (e.metadata_json) {
-      try {
-        const meta = JSON.parse(e.metadata_json);
-        if (meta.actions && meta.actions.length) {
-          const actionList = meta.actions.map(a =>
-            `<div class="ah-action-chip ah-action-chip--${a.type}">${_esc(a.label || a.type)}</div>`
-          ).join('');
-          const pendingBadge = meta.actions_pending
-            ? '<span class="ah-action-pending">pending approval</span>'
-            : '<span class="ah-action-done">executed</span>';
-          metaBlock = `<div class="ah-event-actions">${pendingBadge}${actionList}</div>`;
-        }
-      } catch (_) {}
-    }
-
-    // Message events: summary visible, content behind toggle
-    // Error events: always show full content
-    // Context events: collapsed to one line
-    // Status/lock events: summary only
-    const showContent = e.event_type === 'error' || e._showContent;
-    const contentToggle = (e.event_type === 'message' && hasContent && !showContent)
-      ? `<button class="ah-event-toggle" data-target="${eventId}" title="Show response">+</button>`
-      : '';
-
-    return `
-      <div class="ah-event ah-event--${e.event_type}">
-        <div class="ah-event-header">
-          <span class="ah-event-actor ah-actor--${actorClass}">${_esc(e.actor)}</span>
-          <span class="ah-event-type-label">${typeLabel}</span>
-          <span class="ah-event-time">${_formatTime(e.created_at)}</span>
-          ${contentToggle}
-        </div>
-        ${e.summary ? `<div class="ah-event-summary">${_esc(e.summary)}</div>` : ''}
-        ${showContent && hasContent ? `<div class="ah-event-content" id="${eventId}">${_esc(e.content)}</div>`
-          : hasContent ? `<div class="ah-event-content ah-event-content--collapsed" id="${eventId}" style="display:none">${_esc(e.content)}</div>`
-          : ''}
-        ${metaBlock}
-      </div>
-    `;
-  }).reverse().join('');
+  const timelineItems = _buildTimelineItems(events, task);
+  const timeline = timelineItems.map(item => _renderTimelineItem(item)).reverse().join('');
+  const rawTimeline = events.map(e => _renderRawTimelineEvent(e)).reverse().join('');
 
   const approvalCallout = task.status === 'waiting_for_approval'
     ? `<div class="ah-approval-callout">
@@ -706,6 +699,12 @@ function _renderTaskDetail(task) {
     <div class="ah-timeline">
       <h4 class="ah-timeline-title">Timeline</h4>
       ${timeline || '<div class="ah-empty">No events yet.</div>'}
+      <details class="ah-raw-timeline">
+        <summary>Debug event log</summary>
+        <div class="ah-raw-timeline-body">
+          ${rawTimeline || '<div class="ah-empty">No raw events.</div>'}
+        </div>
+      </details>
     </div>
     <div class="ah-similar-tasks" id="ah-similar-tasks">
       <div class="ah-similar-title">Similar Tasks</div>
@@ -740,6 +739,11 @@ function _renderTaskDetail(task) {
       const hidden = target.style.display === 'none';
       target.style.display = hidden ? 'block' : 'none';
       btn.textContent = hidden ? '\u2212' : '+';
+      if (hidden) {
+        _timelineExpanded.add(btn.dataset.target);
+      } else {
+        _timelineExpanded.delete(btn.dataset.target);
+      }
     });
   });
 
@@ -1551,7 +1555,7 @@ function _wireSplitter(modal) {
 function _eventTypeLabel(eventType) {
   const labels = {
     message: '', status_change: 'status', approval: 'approved',
-    error: 'error', lock: 'locked',
+    error: 'error', lock: 'locked', context: 'context',
   };
   return labels[eventType] || eventType;
 }
@@ -1648,28 +1652,124 @@ async function _doBatchAction(action, taskIds) {
   }
 }
 
-// ── Event collapsing ────────────────────────────────────────────────────
+// ── Timeline presentation ────────────────────────────────────────────────────
 
-function _collapseEvents(events) {
-  // Deduplicate repetitive status changes (role resolution loops)
-  // and collapse context events to summary-only.
-  const out = [];
-  let lastKey = '';
-  for (const e of events) {
-    if (e.event_type === 'status_change' && e.summary && e.summary.includes('Resolved role')) {
-      if (e.summary === lastKey) continue;
-      lastKey = e.summary;
-    } else {
-      lastKey = '';
-    }
-    // Context events: hide full content, show summary only
-    if (e.event_type === 'context') {
-      out.push({ ...e, content: null, _showContent: false });
-    } else {
-      out.push(e);
-    }
+function _eventDomId(prefix, event) {
+  return `ah-${prefix}-${String(event.id || event.created_at || Math.random()).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+}
+
+function _parseEventMeta(event) {
+  if (!event.metadata_json) return {};
+  try {
+    const parsed = JSON.parse(event.metadata_json);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
   }
-  return out;
+}
+
+function _buildTimelineItems(events, task) {
+  const hiddenTypes = new Set(['status_change', 'context', 'lock']);
+  const items = [];
+  for (const event of events || []) {
+    if (hiddenTypes.has(event.event_type)) continue;
+    const meta = _parseEventMeta(event);
+    const isAdapterMessage = event.event_type === 'message' && !['user', 'coordinator'].includes(event.actor);
+    const isCoordinatorResult = event.actor === 'coordinator' && ['message', 'error'].includes(event.event_type);
+    const isComment = event.actor === 'user' && event.event_type === 'message';
+    let kind = event.event_type;
+    let title = event.summary || _eventTypeLabel(event.event_type) || 'Activity';
+
+    if (isAdapterMessage) {
+      kind = 'run';
+      title = event.summary || `${event.actor} activity`;
+    } else if (isCoordinatorResult) {
+      kind = event.event_type === 'error' ? 'error' : 'action';
+      title = event.summary || 'Coordinator result';
+    } else if (isComment) {
+      kind = 'comment';
+      title = event.summary || 'User comment';
+    } else if (event.event_type === 'approval') {
+      kind = 'approval';
+      title = event.summary || 'Approval';
+    } else if (event.event_type === 'error') {
+      kind = 'error';
+      title = event.summary || 'Error';
+    }
+
+    items.push({
+      id: _eventDomId('item', event),
+      event,
+      kind,
+      title,
+      actor: event.actor,
+      time: event.created_at,
+      summary: event.summary,
+      content: event.content,
+      meta,
+      task,
+    });
+  }
+  return items;
+}
+
+function _renderTimelineMeta(meta) {
+  if (!meta || !meta.actions || !meta.actions.length) return '';
+  const actionList = meta.actions.map(a =>
+    `<div class="ah-action-chip ah-action-chip--${_esc(a.type)}">${_esc(a.label || a.command || a.path || a.type)}</div>`
+  ).join('');
+  const pendingBadge = meta.actions_pending
+    ? '<span class="ah-action-pending">pending approval</span>'
+    : '<span class="ah-action-done">executed</span>';
+  return `<div class="ah-event-actions">${pendingBadge}${actionList}</div>`;
+}
+
+function _renderTimelineItem(item) {
+  const event = item.event;
+  const actorClass = _actorClass(item.actor);
+  const typeLabel = item.kind === 'run' ? 'run' : _eventTypeLabel(event.event_type);
+  const hasContent = !!(item.content && item.content.length);
+  const isExpanded = _timelineExpanded.has(item.id) || item.kind === 'error';
+  const contentToggle = hasContent && item.kind !== 'error'
+    ? `<button class="ah-event-toggle" data-target="${item.id}" title="${isExpanded ? 'Hide details' : 'Show details'}">${isExpanded ? '\u2212' : '+'}</button>`
+    : '';
+  return `
+    <div class="ah-event ah-event--${_esc(event.event_type)} ah-timeline-item--${_esc(item.kind)}">
+      <div class="ah-event-header">
+        <span class="ah-event-actor ah-actor--${actorClass}">${_esc(item.actor)}</span>
+        <span class="ah-event-type-label">${typeLabel}</span>
+        <span class="ah-event-time">${_formatTime(item.time)}</span>
+        ${contentToggle}
+      </div>
+      <div class="ah-event-summary">${_esc(item.title)}</div>
+      ${hasContent ? `<div class="ah-event-content ${isExpanded ? '' : 'ah-event-content--collapsed'}" id="${item.id}" style="display:${isExpanded ? 'block' : 'none'}">${_esc(item.content)}</div>` : ''}
+      ${_renderTimelineMeta(item.meta)}
+    </div>
+  `;
+}
+
+function _renderRawTimelineEvent(event) {
+  const actorClass = _actorClass(event.actor);
+  const typeLabel = _eventTypeLabel(event.event_type);
+  const hasContent = !!(event.content && event.content.length);
+  const id = _eventDomId('raw', event);
+  const isExpanded = _timelineExpanded.has(id) || event.event_type === 'error';
+  const contentToggle = hasContent
+    ? `<button class="ah-event-toggle" data-target="${id}" title="${isExpanded ? 'Hide details' : 'Show details'}">${isExpanded ? '\u2212' : '+'}</button>`
+    : '';
+  return `
+    <div class="ah-event ah-event--${_esc(event.event_type)} ah-raw-event">
+      <div class="ah-event-header">
+        <span class="ah-event-actor ah-actor--${actorClass}">${_esc(event.actor)}</span>
+        <span class="ah-event-type-label">${typeLabel}</span>
+        <span class="ah-event-time">${_formatTime(event.created_at)}</span>
+        ${contentToggle}
+      </div>
+      ${event.summary ? `<div class="ah-event-summary">${_esc(event.summary)}</div>` : ''}
+      ${hasContent ? `<div class="ah-event-content ${isExpanded ? '' : 'ah-event-content--collapsed'}" id="${id}" style="display:${isExpanded ? 'block' : 'none'}">${_esc(event.content)}</div>` : ''}
+      ${_renderTimelineMeta(_parseEventMeta(event))}
+    </div>
+  `;
 }
 
 function _formatDuration(task) {
