@@ -23,10 +23,11 @@ import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from core.database import SessionLocal, AgentTask, AgentEvent
 from src.agent_hub_events import publish as _publish_event
+from src.task_scheduler import compute_next_run, compute_next_interval, _utcnow
 from sqlalchemy import or_
 
 logger = logging.getLogger(__name__)
@@ -239,6 +240,11 @@ async def start():
     if os.getenv("AGENT_HUB_ENABLED", "true").lower() in ("0", "false", "no", "off"):
         logger.info("Agent Hub coordinator disabled (AGENT_HUB_ENABLED=false)")
         return
+
+    # On startup, advance overdue scheduled tasks' next_run_at by 60s to
+    # prevent double-firing after restart (mirrors TaskScheduler.start() pattern).
+    _advance_overdue_scheduled_on_startup()
+
     _running = True
     _coordinator_task = asyncio.create_task(_coordinator_loop())
     logger.info(
@@ -579,7 +585,11 @@ async def _coordinator_loop():
 
 
 async def _tick():
-    """Coordinator tick — claim and dispatch all eligible queued tasks.
+    """Coordinator tick — activate scheduled tasks, then claim and dispatch queued.
+
+    Phase 0: Activate due scheduled/paused tasks (clone recurring templates,
+    transition one-shots to queued).
+    Phase 1: Claim and dispatch all eligible queued tasks (existing behavior).
 
     Resolves roles, checks dependencies, and enforces concurrency caps
     (global, per-adapter, per-role). Eligible tasks are dispatched in
@@ -589,6 +599,9 @@ async def _tick():
 
     db = SessionLocal()
     try:
+        # Phase 0: Activate due scheduled tasks BEFORE the claim loop
+        await _activate_due_scheduled(db)
+
         # Find ALL queued, unlocked tasks sorted by creation time
         candidates = (
             db.query(AgentTask)
@@ -987,3 +1000,148 @@ def execute_pending_actions(task_id: str) -> list[dict]:
         db.close()
 
     return results
+
+
+# ── Scheduled task helpers ────────────────────────────────────────────────────
+
+
+def _advance_overdue_scheduled_on_startup():
+    """Advance next_run_at for overdue scheduled Agent Hub tasks on startup.
+
+    Mirrors TaskScheduler.start() in src/task_scheduler.py (line 377-402).
+    Without this, a restart re-dispatches the same overdue tasks on every
+    poll because the in-memory guard resets.
+    """
+    try:
+        db = SessionLocal()
+        try:
+            now = _utcnow()
+            overdue = db.query(AgentTask).filter(
+                AgentTask.status == "scheduled",
+                AgentTask.next_run_at.isnot(None),
+                AgentTask.next_run_at < now,
+            ).all()
+            if overdue:
+                for t in overdue:
+                    t.next_run_at = now + timedelta(seconds=60)
+                db.commit()
+                logger.info(
+                    "Pushed next_run_at forward by 60s for %d overdue scheduled tasks",
+                    len(overdue),
+                )
+        finally:
+            db.close()
+    except Exception:
+        logger.exception("Failed to advance overdue scheduled tasks on startup")
+
+
+def _compute_next_for_template(template: AgentTask, after=None):
+    """Compute the next run time for a scheduled template.
+
+    Dispatches to compute_next_run() (cron, once with parsed datetime) or
+    compute_next_interval() (interval expressions).
+    """
+    if template.schedule_type == "cron":
+        return compute_next_run(
+            "cron", None, cron_expression=template.schedule_expr, after=after,
+        )
+    elif template.schedule_type == "interval":
+        return compute_next_interval(template.schedule_expr, after=after)
+    elif template.schedule_type == "once":
+        return compute_next_run(
+            "once", None, scheduled_date=template.next_run_at,
+        )
+    return None
+
+
+async def _activate_due_scheduled(db):
+    """Find scheduled tasks due for activation and transition/clone them.
+
+    Called at the top of _tick() before the normal claim loop.
+    Recurring templates (interval/cron) are cloned; one-shot tasks
+    transition directly to queued.
+    """
+    now = _utcnow()
+    due = db.query(AgentTask).filter(
+        AgentTask.status == "scheduled",
+        AgentTask.next_run_at <= now,
+    ).order_by(AgentTask.next_run_at).all()
+
+    if not due:
+        return
+
+    # Phase 1: Clone all recurring templates, track mapping
+    clone_map = {}  # template_id → clone_id
+    for template in due:
+        if template.schedule_type in ("interval", "cron"):
+            # Overlap check
+            if not template.allow_overlap:
+                active_clone = db.query(AgentTask).filter(
+                    AgentTask.scheduled_template_id == template.id,
+                    AgentTask.status.in_(["queued", "running", "waiting_for_approval"]),
+                ).first()
+                if active_clone:
+                    template.next_run_at = _compute_next_for_template(template, after=now)
+                    logger.debug(
+                        "Skipped scheduled run for template %s — prior clone still active",
+                        template.id,
+                    )
+                    continue
+
+            # Clone the template
+            clone = AgentTask(
+                id=str(uuid.uuid4()),
+                title=template.title,
+                objective=template.objective,
+                role=template.role,
+                owner=template.owner,
+                status="queued",
+                priority=template.priority,
+                sandbox_mode=template.sandbox_mode,
+                tags=template.tags,
+                chain_task_id=template.chain_task_id,
+                scheduled_template_id=template.id,
+                scheduled_run_at=template.next_run_at,
+            )
+            db.add(clone)
+            db.flush()  # get clone.id
+            _record_event(db, clone.id, "coordinator", "status_change",
+                          summary=f"Auto-activated by schedule from '{template.title}'")
+            clone_map[template.id] = clone.id
+
+            # Advance template to next run
+            template.next_run_at = _compute_next_for_template(template, after=now)
+
+        elif template.schedule_type == "once":
+            # One-shot: transition directly
+            template.status = "queued"
+            template.next_run_at = None
+            _record_event(db, template.id, "coordinator", "status_change",
+                          summary="Scheduled task activated")
+
+    # Phase 2: Resolve dependencies for clones
+    for template_id, clone_id in list(clone_map.items()):
+        template = next((t for t in due if t.id == template_id), None)
+        if not template or not template.depends_on:
+            continue
+
+        mapped = []
+        skip = False
+        for dep_id in template.depends_on:
+            if dep_id in clone_map:
+                mapped.append(clone_map[dep_id])
+            else:
+                skip = True
+                logger.warning(
+                    "Skipping clone of template %s — dependency template %s not in due batch",
+                    template_id, dep_id,
+                )
+                break
+        if skip:
+            clone_map.pop(template_id, None)
+            continue
+        clone = db.query(AgentTask).filter(AgentTask.id == clone_id).first()
+        if clone:
+            clone.depends_on = mapped
+
+    db.commit()

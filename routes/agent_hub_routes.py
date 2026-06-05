@@ -30,18 +30,21 @@ logger = logging.getLogger(__name__)
 VALID_STATUSES = {
     "draft", "queued", "running", "waiting_for_approval",
     "blocked", "done", "cancelled",
+    "scheduled", "paused",
 }
 
 # Allowed transitions (source → set of valid targets).
 # Any status can transition to "cancelled" (explicit cancel path).
 TRANSITIONS: dict[str, set[str]] = {
-    "draft":                 {"queued", "cancelled"},
+    "draft":                 {"queued", "scheduled", "cancelled"},
     "queued":                {"running", "cancelled"},
     "running":               {"waiting_for_approval", "queued", "blocked", "done", "cancelled"},
     "waiting_for_approval":  {"queued", "blocked", "done", "cancelled"},
     "blocked":               {"queued", "cancelled"},
     "done":                  set(),          # terminal
     "cancelled":             set(),          # terminal
+    "scheduled":             {"queued", "paused", "cancelled"},
+    "paused":                {"scheduled", "cancelled"},
 }
 
 VALID_ACTORS = {"user", "hermes", "codex", "cursor", "coordinator"}
@@ -60,15 +63,16 @@ class TaskCreate(BaseModel):
     due_date: Optional[str] = None
     phase: Optional[str] = None
     current_owner: Optional[str] = None
-    role: Optional[str] = None
-    # diagnoser | implementer | verifier — resolved to adapter at dispatch time
     approval_required: bool = False
     session_id: Optional[str] = None
     chain_task_id: Optional[str] = None
     sandbox_mode: str = "workspace-write"
+    role: Optional[str] = None
     depends_on: Optional[list] = None
-    # List of task IDs that must be done before this one runs
     tags: list[str] = []
+    schedule_type: Optional[str] = None    # 'once', 'interval', 'cron'
+    schedule_expr: Optional[str] = None    # '30m', 'every 2h', '0 9 * * *', ISO ts
+    allow_overlap: bool = False
 
 
 class TaskUpdate(BaseModel):
@@ -86,6 +90,9 @@ class TaskUpdate(BaseModel):
     sandbox_mode: Optional[str] = None
     depends_on: Optional[list] = None
     tags: Optional[list[str]] = None
+    schedule_type: Optional[str] = None
+    schedule_expr: Optional[str] = None
+    allow_overlap: Optional[bool] = None
 
 
 class EventCreate(BaseModel):
@@ -160,6 +167,12 @@ def _task_to_dict(t: AgentTask) -> dict:
         "depends_on": t.depends_on,
         "created_by_task_id": t.created_by_task_id,
         "tags": t.tags or [],
+        "schedule_type": t.schedule_type,
+        "schedule_expr": t.schedule_expr,
+        "next_run_at": t.next_run_at.isoformat() + "Z" if t.next_run_at else None,
+        "allow_overlap": t.allow_overlap,
+        "scheduled_template_id": t.scheduled_template_id,
+        "scheduled_run_at": t.scheduled_run_at.isoformat() + "Z" if t.scheduled_run_at else None,
         "started_at": started,
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
@@ -594,22 +607,96 @@ def setup_agent_hub_routes() -> APIRouter:
         if body.role is not None and body.role not in VALID_ROLES:
             raise HTTPException(400, f"Invalid role: {body.role}")
 
+        # Schedule validation
+        next_run_at = None
+        final_status = body.status
+        if body.schedule_type:
+            if body.schedule_type not in ("once", "interval", "cron"):
+                raise HTTPException(400, f"Invalid schedule_type: {body.schedule_type}")
+            if not body.schedule_expr:
+                raise HTTPException(400, "schedule_expr is required when schedule_type is set")
+
+            from src.task_scheduler import compute_next_run, compute_next_interval
+
+            if body.schedule_type == "cron":
+                try:
+                    from croniter import croniter
+                    croniter(body.schedule_expr)
+                except Exception:
+                    raise HTTPException(422, f"Invalid cron expression: {body.schedule_expr}")
+                next_run_at = compute_next_run(
+                    "cron", None, cron_expression=body.schedule_expr,
+                )
+
+            elif body.schedule_type == "interval":
+                next_run_at = compute_next_interval(body.schedule_expr)
+                if next_run_at is None:
+                    raise HTTPException(422, f"Invalid interval expression: {body.schedule_expr}")
+
+            elif body.schedule_type == "once":
+                # Parse relative delay or ISO timestamp
+                from datetime import datetime as _dt
+                if body.schedule_expr and body.schedule_expr[0].isdigit():
+                    # Try ISO timestamp first
+                    try:
+                        parsed = _dt.fromisoformat(body.schedule_expr)
+                        next_run_at = compute_next_run(
+                            "once", None, scheduled_date=parsed,
+                        )
+                    except ValueError:
+                        # Try relative delay
+                        next_run_at = compute_next_interval(body.schedule_expr)
+                        if next_run_at is None:
+                            raise HTTPException(
+                                422,
+                                f"Invalid once schedule: {body.schedule_expr}. "
+                                "Use ISO timestamp or relative delay (30m, 2h).",
+                            )
+                else:
+                    next_run_at = compute_next_interval(body.schedule_expr)
+                    if next_run_at is None:
+                        raise HTTPException(
+                            422,
+                            f"Invalid once schedule: {body.schedule_expr}",
+                        )
+
+            if next_run_at is None:
+                raise HTTPException(400, f"Could not compute next run for {body.schedule_expr}")
+            final_status = "scheduled"
+
         db = SessionLocal()
         try:
             # Validate dependencies
             dep_ids = None
             if body.depends_on is not None:
                 dep_ids = _validate_dependencies(body.depends_on, db)
-                # Cycle check: new task doesn't have an ID yet, but we check that
-                # none of the deps transitively depend on each other in a cycle
-                # (full cycle detection happens on update when task has an ID)
+                # If this is a scheduled template with deps, validate they are
+                # also scheduled templates with aligned schedules
+                if body.schedule_type in ("interval", "cron"):
+                    for dep_id in dep_ids:
+                        dep_task = db.query(AgentTask).filter(AgentTask.id == dep_id).first()
+                        if dep_task and dep_task.schedule_type not in ("interval", "cron"):
+                            raise HTTPException(
+                                400,
+                                f"Dependency {dep_id} is not a scheduled template. "
+                                "Recurring template dependencies must be other scheduled templates.",
+                            )
+                        if dep_task and (
+                            dep_task.schedule_type != body.schedule_type
+                            or dep_task.schedule_expr != body.schedule_expr
+                        ):
+                            raise HTTPException(
+                                400,
+                                f"Dependency {dep_id} has a different schedule. "
+                                "Recurring template dependencies must share the same schedule.",
+                            )
 
             task = AgentTask(
                 id=str(uuid.uuid4()),
                 owner=user,
                 title=body.title,
                 objective=body.objective,
-                status=body.status,
+                status=final_status,
                 priority=body.priority,
                 due_date=body.due_date or None,
                 phase=body.phase,
@@ -621,6 +708,10 @@ def setup_agent_hub_routes() -> APIRouter:
                 chain_task_id=body.chain_task_id,
                 sandbox_mode=body.sandbox_mode,
                 tags=body.tags,
+                schedule_type=body.schedule_type,
+                schedule_expr=body.schedule_expr,
+                next_run_at=next_run_at,
+                allow_overlap=body.allow_overlap,
             )
             db.add(task)
             db.commit()
@@ -709,6 +800,23 @@ def setup_agent_hub_routes() -> APIRouter:
                 task.depends_on = dep_ids if dep_ids else None
             if body.tags is not None:
                 task.tags = body.tags
+            if body.schedule_type is not None:
+                if body.schedule_type not in ("once", "interval", "cron", ""):
+                    raise HTTPException(400, f"Invalid schedule_type: {body.schedule_type}")
+                task.schedule_type = body.schedule_type if body.schedule_type else None
+            if body.schedule_expr is not None:
+                task.schedule_expr = body.schedule_expr if body.schedule_expr else None
+                # Recompute next_run_at if schedule_expr changed
+                if task.schedule_type and task.schedule_expr and task.status == "scheduled":
+                    from src.task_scheduler import compute_next_run, compute_next_interval
+                    if task.schedule_type == "cron":
+                        task.next_run_at = compute_next_run(
+                            "cron", None, cron_expression=task.schedule_expr,
+                        )
+                    elif task.schedule_type == "interval":
+                        task.next_run_at = compute_next_interval(task.schedule_expr)
+            if body.allow_overlap is not None:
+                task.allow_overlap = body.allow_overlap
 
             db.commit()
             db.refresh(task)
@@ -723,7 +831,12 @@ def setup_agent_hub_routes() -> APIRouter:
 
     @router.delete("/tasks/{task_id}")
     async def delete_task(request: Request, task_id: str):
-        """Delete a task and all its events (cascade)."""
+        """Delete a task and all its events (cascade).
+
+        Templates with active clones (queued/running/waiting_for_approval) are
+        blocked from deletion. Historical clones (done/cancelled/blocked) are
+        allowed — they keep their dangling scheduled_template_id.
+        """
         user = get_current_user(request)
         db = SessionLocal()
         try:
@@ -732,6 +845,19 @@ def setup_agent_hub_routes() -> APIRouter:
                 raise HTTPException(404, "Task not found")
             if user and task.owner and task.owner != user:
                 raise HTTPException(404, "Task not found")
+
+            # Template deletion guard: block if active clones exist
+            if task.schedule_type in ("interval", "cron"):
+                active_clones = db.query(AgentTask).filter(
+                    AgentTask.scheduled_template_id == task_id,
+                    AgentTask.status.in_(["queued", "running", "waiting_for_approval"]),
+                ).count()
+                if active_clones:
+                    raise HTTPException(
+                        409,
+                        f"Cannot delete template — {active_clones} scheduled runs still active. Cancel them first.",
+                    )
+
             db.delete(task)
             db.commit()
             _delete_task_from_rag(task_id)
@@ -1181,11 +1307,36 @@ def setup_agent_hub_routes() -> APIRouter:
                     elif body.action == "cancel":
                         task.status = "cancelled"
                         task.locked_by = None
+                        task.next_run_at = None  # prevent startup sweep from reviving
                         db.flush()
                     elif body.action == "retry":
-                        task.status = "queued"
-                        task.locked_by = None
-                        task.attempts = 0
+                        # Special-case: retry on scheduled/paused templates
+                        # creates a one-shot clone; template is left unchanged.
+                        if task.status in ("scheduled", "paused"):
+                            clone = AgentTask(
+                                id=str(uuid.uuid4()),
+                                title=task.title,
+                                objective=task.objective,
+                                role=task.role,
+                                owner=task.owner,
+                                status="queued",
+                                priority=task.priority,
+                                sandbox_mode=task.sandbox_mode,
+                                tags=task.tags,
+                                scheduled_template_id=task.id,
+                                scheduled_run_at=task.next_run_at,
+                            )
+                            db.add(clone)
+                            db.flush()
+                            _record_event(db, clone.id, "coordinator", "status_change",
+                                          summary=f"Manual retry from template '{task.title}'")
+                            result_dict = _task_to_dict(clone)
+                            from src.agent_hub_events import publish
+                            publish(user or "", "task_created", result_dict)
+                        else:
+                            task.status = "queued"
+                            task.locked_by = None
+                            task.attempts = 0
                         db.flush()
 
                     results.succeeded += 1

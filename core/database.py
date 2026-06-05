@@ -599,9 +599,22 @@ class AgentTask(TimestampMixin, Base):
     # Freeform user labels for categorization and filtering
     due_date          = Column(String, nullable=True)
     # ISO 8601 date string (YYYY-MM-DD)
+    schedule_type     = Column(String(20), nullable=True)
+    # 'once', 'interval', 'cron', null
+    schedule_expr     = Column(String(100), nullable=True)
+    # '30m', 'every 2h', '0 9 * * *', ISO timestamp
+    next_run_at       = Column(DateTime, nullable=True)
+    # computed next activation time
+    allow_overlap     = Column(Boolean, default=False)
+    # allow concurrent clones from same template
+    scheduled_template_id = Column(String, nullable=True, index=True)
+    # FK → agent_tasks.id (set on clones, NOT templates)
+    scheduled_run_at  = Column(DateTime, nullable=True)
+    # the next_run_at that triggered this clone
 
     __table_args__ = (
         Index('ix_agent_tasks_status_owner', 'status', 'owner'),
+        Index('ix_agent_tasks_next_run', 'status', 'next_run_at'),
     )
 
 
@@ -1689,6 +1702,7 @@ def init_db():
     _migrate_add_agent_task_tags_column()
     _migrate_add_agent_task_priority_column()
     _migrate_add_agent_task_due_date_column()
+    _migrate_add_agent_task_schedule_columns()
     _migrate_add_workflow_templates_table()
     _migrate_agent_search_fts()
 
@@ -1912,6 +1926,37 @@ def _migrate_add_agent_task_due_date_column():
         logging.getLogger(__name__).info("Migrated: added due_date column to agent_tasks")
     except OperationalError as e:
         logging.getLogger(__name__).warning(f"agent_tasks.due_date migration failed: {e}")
+
+
+def _migrate_add_agent_task_schedule_columns():
+    """Add schedule columns to agent_tasks if they don't exist."""
+    _add_column_if_missing("agent_tasks", "schedule_type", "TEXT")
+    _add_column_if_missing("agent_tasks", "schedule_expr", "TEXT")
+    _add_column_if_missing("agent_tasks", "next_run_at", "TIMESTAMP")
+    _add_column_if_missing("agent_tasks", "allow_overlap", "BOOLEAN DEFAULT 0")
+    _add_column_if_missing("agent_tasks", "scheduled_template_id", "TEXT")
+    _add_column_if_missing("agent_tasks", "scheduled_run_at", "TIMESTAMP")
+    # Create composite index for due-task queries
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_tasks_next_run "
+                "ON agent_tasks (status, next_run_at)"
+            ))
+        logging.getLogger(__name__).info("Migrated: added schedule columns to agent_tasks")
+    except OperationalError as e:
+        logging.getLogger(__name__).warning(f"agent_tasks schedule index migration: {e}")
+
+
+def _add_column_if_missing(table: str, column: str, col_type: str):
+    """Add a column to a table if it doesn't already exist (idempotent)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+            ))
+    except OperationalError:
+        pass  # column already exists
 
 
 def _migrate_add_workflow_templates_table():

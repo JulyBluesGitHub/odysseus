@@ -118,6 +118,8 @@ function _getModal() {
               <option value="blocked">Blocked</option>
               <option value="done">Done</option>
               <option value="cancelled">Cancelled</option>
+              <option value="scheduled">Scheduled</option>
+              <option value="paused">Paused</option>
             </select>
             <select class="ah-filter" id="ah-owner-filter">
               <option value="">Any Owner</option>
@@ -1080,8 +1082,9 @@ async function _showNewTaskForm() {
           <option value="verifier">Verifier</option>
         </select>
         <select class="ah-input" id="ah-new-priority">
-          <option value="medium" selected>Medium</option>
+          <option value="" selected>Priority (default: Medium)</option>
           <option value="high">High</option>
+          <option value="medium">Medium</option>
           <option value="low">Low</option>
         </select>
       </div>

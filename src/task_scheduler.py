@@ -184,6 +184,27 @@ def compute_next_run(schedule: str, scheduled_time: str,
     return None
 
 
+def compute_next_interval(expr: str, after: datetime = None) -> datetime | None:
+    """Parse interval expressions and return next run as naive UTC.
+
+    Supports both recurring ('every 2h') and relative-delay one-shot ('30m', '2h').
+    The 'every ' prefix is optional; its presence signals recurrence (caller decides).
+
+    Returns None for unparseable or zero/negative values so callers can fail
+    gracefully (e.g. route-level 422).
+    """
+    import re
+    m = re.match(r'^(?:every\s+)?(\d+)\s*(h|m|d)$', expr.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    if n <= 0:
+        return None
+    delta = {"h": timedelta(hours=n), "m": timedelta(minutes=n), "d": timedelta(days=n)}[unit]
+    now = after or _utcnow()
+    return now + delta
+
+
 def _resolve_task_timezone(db, task) -> str | None:
     """Look up the IANA timezone name for a task via its linked CrewMember, if any."""
     if not getattr(task, "crew_member_id", None):
