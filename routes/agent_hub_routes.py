@@ -578,7 +578,8 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
-            _index_task_for_rag(task)
+            import asyncio as _asyncio
+            _asyncio.create_task(_asyncio.to_thread(_index_task_for_rag, task))
             # Publish after commit succeeds
             from src.agent_hub_events import publish
             publish(user or "", "task_created", result)
@@ -658,7 +659,8 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
-            _index_task_for_rag(task)
+            import asyncio as _asyncio
+            _asyncio.create_task(_asyncio.to_thread(_index_task_for_rag, task))
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result
@@ -779,7 +781,8 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
-            _index_task_for_rag(task)
+            import asyncio as _asyncio
+            _asyncio.create_task(_asyncio.to_thread(_index_task_for_rag, task))
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result
@@ -974,7 +977,8 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
-            _index_task_for_rag(task)
+            import asyncio as _asyncio
+            _asyncio.create_task(_asyncio.to_thread(_index_task_for_rag, task))
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result
