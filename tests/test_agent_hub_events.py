@@ -8,6 +8,7 @@ import json
 import sys
 import types as _types
 import uuid
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -977,3 +978,71 @@ class TestPriorities:
         })
         assert r2.status_code == 200
         assert r2.json()["priority"] == "low"
+
+
+class TestDueDates:
+    """Tests for Agent Hub task due dates."""
+
+    def test_create_with_due_date(self, client):
+        due_date = "2026-06-15"
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": f"Due create {uuid.uuid4().hex}",
+            "status": "draft",
+            "due_date": due_date,
+        })
+        assert r.status_code == 201
+        assert r.json()["due_date"] == due_date
+
+    def test_update_due_date(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": f"Due update {uuid.uuid4().hex}",
+            "status": "draft",
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+        due_date = "2026-06-20"
+
+        r2 = client.put(f"/api/agent-hub/tasks/{task_id}", json={
+            "due_date": due_date,
+        })
+        assert r2.status_code == 200
+        assert r2.json()["due_date"] == due_date
+
+    def test_filter_overdue(self, client):
+        past_due = (date.today() - timedelta(days=1)).isoformat()
+        title = f"Overdue filter {uuid.uuid4().hex}"
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": title,
+            "status": "draft",
+            "due_date": past_due,
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.get("/api/agent-hub/tasks?overdue=true")
+        assert r2.status_code == 200
+        tasks = r2.json()["tasks"]
+        assert any(t["id"] == task_id for t in tasks)
+
+    def test_overdue_excludes_done(self, client):
+        past_due = (date.today() - timedelta(days=1)).isoformat()
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": f"Overdue done {uuid.uuid4().hex}",
+            "status": "done",
+            "due_date": past_due,
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.get("/api/agent-hub/tasks?overdue=true")
+        assert r2.status_code == 200
+        tasks = r2.json()["tasks"]
+        assert all(t["id"] != task_id for t in tasks)
+
+    def test_due_date_nullable(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": f"Due nullable {uuid.uuid4().hex}",
+            "status": "draft",
+        })
+        assert r.status_code == 201
+        assert r.json()["due_date"] is None

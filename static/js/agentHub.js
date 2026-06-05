@@ -104,6 +104,7 @@ function _getModal() {
               <option value="medium">Medium</option>
               <option value="low">Low</option>
             </select>
+            <label class="ah-overdue-filter"><input type="checkbox" id="ah-overdue-filter"> Overdue only</label>
             <select class="ah-filter" id="ah-status-filter">
               <option value="">All Statuses</option>
               <option value="draft">Draft</option>
@@ -175,6 +176,7 @@ function _getModal() {
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-tag-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-priority-filter').addEventListener('change', () => _renderFromCache());
+  modal.querySelector('#ah-overdue-filter').addEventListener('change', () => _renderFromCache());
 
   // Sort dropdown
   modal.querySelector('#ah-sort').addEventListener('change', () => _renderFromCache());
@@ -322,17 +324,20 @@ async function _fetchTasks() {
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
   const priorityEl = document.getElementById('ah-priority-filter');
+  const overdueEl = document.getElementById('ah-overdue-filter');
   const params = new URLSearchParams();
   const status = statusEl?.value;
   const owner = ownerEl?.value;
   const search = searchEl?.value.trim();
   const tag = tagEl?.value.trim();
   const priority = priorityEl?.value;
+  const overdue = overdueEl?.checked;
   if (status) params.set('status', status);
   if (owner) params.set('owner', owner);
   if (search) params.set('q', search);
   if (tag) params.set('tag', tag);
   if (priority) params.set('priority', priority);
+  if (overdue) params.set('overdue', 'true');
   const url = `${API_BASE}/api/agent-hub/tasks${params.toString() ? '?' + params : ''}`;
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
@@ -393,11 +398,13 @@ function _getFilteredTasks() {
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
   const priorityEl = document.getElementById('ah-priority-filter');
+  const overdueEl = document.getElementById('ah-overdue-filter');
   const status = statusEl?.value || '';
   const owner = ownerEl?.value || '';
   const search = (searchEl?.value || '').trim().toLowerCase();
   const tag = (tagEl?.value || '').trim().toLowerCase();
   const priority = priorityEl?.value || '';
+  const overdue = overdueEl?.checked || false;
 
   let tasks = Array.from(_taskMap.values());
 
@@ -409,6 +416,9 @@ function _getFilteredTasks() {
   }
   if (priority) {
     tasks = tasks.filter(t => (t.priority || 'medium') === priority);
+  }
+  if (overdue) {
+    tasks = tasks.filter(t => _isTaskOverdue(t));
   }
   if (search) {
     tasks = tasks.filter(t =>
@@ -472,6 +482,7 @@ function _renderTaskList(tasks) {
     const checked = _selected.has(t.id) ? 'checked' : '';
     const priority = ['high', 'medium', 'low'].includes(t.priority) ? t.priority : 'medium';
     const tagsHtml = (t.tags || []).map(tag => `<span class="ah-task-tag">${_esc(tag)}</span>`).join('');
+    const dueDateHtml = _formatDueDateMeta(t);
     return `
       <div class="ah-task-item ${activeClass}" data-task-id="${t.id}" data-status="${t.status}" ${runningAttr} ${doneAttr}>
         <div class="ah-task-item-header">
@@ -491,6 +502,7 @@ function _renderTaskList(tasks) {
           ${t.depends_on && t.depends_on.length ? `<span class="ah-task-dep-badge" title="Waiting on ${t.depends_on.length} dependencies">${t.depends_on.length}</span>` : ''}
           <span class="ah-task-owner">${t.current_owner || 'unassigned'}</span>
           <span class="ah-task-status">${t.status}</span>
+          ${dueDateHtml}
           ${_formatDuration(t) ? `<span class="ah-task-duration">${_formatDuration(t)}</span>` : ''}
           <span class="ah-task-timer ${t.started_at ? '' : 'ah-task-timer--hidden'}"></span>
         </div>
@@ -531,6 +543,27 @@ function _renderTaskList(tasks) {
       _onCheckboxChange(cb.dataset.id, cb.checked);
     });
   });
+}
+
+function _todayDateString() {
+  const now = new Date();
+  const local = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return local.toISOString().slice(0, 10);
+}
+
+function _isTaskOverdue(task) {
+  return !!task.due_date &&
+    task.due_date < _todayDateString() &&
+    !['done', 'cancelled'].includes(task.status);
+}
+
+function _formatDueDateMeta(task) {
+  if (!task.due_date) return '';
+  const date = _esc(task.due_date);
+  if (_isTaskOverdue(task)) {
+    return `<span class="ah-due-overdue">Overdue: ${date}</span>`;
+  }
+  return `<span class="ah-due-upcoming">Due: ${date}</span>`;
 }
 
 function _renderTaskDetail(task) {
@@ -926,6 +959,9 @@ async function _showNewTaskForm() {
         </select>
       </div>
       <div class="ah-new-task-row">
+        <input type="date" class="ah-input" id="ah-new-due-date">
+      </div>
+      <div class="ah-new-task-row">
         <input class="ah-input" id="ah-new-chain" placeholder="Triggered by task ID (optional)" value="" style="flex:1;">
       </div>
       <div class="ah-new-task-row ah-new-task-row--sandbox">
@@ -985,7 +1021,8 @@ async function _showNewTaskForm() {
     const sandbox = document.getElementById('ah-new-sandbox').value;
     const role = document.getElementById('ah-new-role')?.value || undefined;
     const priority = document.getElementById('ah-new-priority').value;
-    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, priority, sandbox_mode: sandbox, tags: _newTags };
+    const due_date = document.getElementById('ah-new-due-date')?.value || undefined;
+    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, priority, due_date, sandbox_mode: sandbox, tags: _newTags };
     // Auto-queue if assigned to a non-user agent OR a role is set
     if ((owner && owner !== 'user') || role) body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);

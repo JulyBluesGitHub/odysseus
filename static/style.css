@@ -21440,6 +21440,10 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-search-input { max-width: 160px; flex-grow: 1; }
 .ah-priority-filter { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 110px; }
 .ah-tag-input { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; max-width: 120px; }
+.ah-due-overdue { color: #cc4444; font-weight: 600; font-size: 10px; }
+.ah-due-upcoming { color: #f0a030; font-size: 10px; opacity: 0.8; }
+.ah-overdue-filter { font-size: 11px; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.ah-input[type="date"] { font-size: 11px; padding: 2px 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; }
 .ah-tag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
 .ah-tag-chip { display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--accent, #5b8abf); color: var(--accent, #5b8abf); font-size: 10px; line-height: 1.4; }
 .ah-tag-remove { display: inline; background: none; border: none; color: inherit; cursor: pointer; opacity: 0.6; padding: 0; font: inherit; line-height: 1; }

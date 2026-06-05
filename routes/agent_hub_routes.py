@@ -11,7 +11,7 @@ Route convention: ``setup_agent_hub_routes() -> APIRouter`` (matches the existin
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Query
@@ -57,6 +57,7 @@ class TaskCreate(BaseModel):
     objective: Optional[str] = None
     status: str = "draft"
     priority: str = "medium"
+    due_date: Optional[str] = None
     phase: Optional[str] = None
     current_owner: Optional[str] = None
     role: Optional[str] = None
@@ -75,6 +76,7 @@ class TaskUpdate(BaseModel):
     objective: Optional[str] = None
     status: Optional[str] = None
     priority: Optional[str] = None
+    due_date: Optional[str] = None
     phase: Optional[str] = None
     current_owner: Optional[str] = None
     role: Optional[str] = None
@@ -143,6 +145,7 @@ def _task_to_dict(t: AgentTask) -> dict:
         "objective": t.objective,
         "status": t.status,
         "priority": t.priority or "medium",
+        "due_date": t.due_date or None,
         "phase": t.phase,
         "current_owner": t.current_owner,
         "role": t.role,
@@ -513,8 +516,9 @@ def setup_agent_hub_routes() -> APIRouter:
         q: Optional[str] = Query(None, description="Free-text search on title and objective"),
         tag: Optional[str] = Query(None),
         priority: Optional[str] = Query(None),
+        overdue: bool = Query(False),
     ):
-        """List Agent Hub tasks, optionally filtered by status, owner, priority, tag, and/or keyword search."""
+        """List Agent Hub tasks, optionally filtered by status, owner, priority, tag, due date, and/or keyword search."""
         user = get_current_user(request)
         db = SessionLocal()
         try:
@@ -533,6 +537,12 @@ def setup_agent_hub_routes() -> APIRouter:
                 qobj = qobj.filter(AgentTask.priority == priority)
             if tag:
                 qobj = qobj.filter(AgentTask.tags.contains([tag]))
+            if overdue:
+                qobj = qobj.filter(
+                    AgentTask.due_date.isnot(None),
+                    AgentTask.due_date < date.today().isoformat(),
+                    AgentTask.status.notin_(["done", "cancelled"]),
+                )
             if q:
                 pattern = f"%{q}%"
                 qobj = qobj.filter(or_(
@@ -576,6 +586,7 @@ def setup_agent_hub_routes() -> APIRouter:
                 objective=body.objective,
                 status=body.status,
                 priority=body.priority,
+                due_date=body.due_date or None,
                 phase=body.phase,
                 current_owner=body.current_owner,
                 role=body.role,
@@ -644,6 +655,8 @@ def setup_agent_hub_routes() -> APIRouter:
                 if body.priority not in VALID_PRIORITIES:
                     raise HTTPException(400, f"Invalid priority: {body.priority}")
                 task.priority = body.priority
+            if body.due_date is not None:
+                task.due_date = body.due_date if body.due_date else None
             if body.phase is not None:
                 task.phase = body.phase
             if body.current_owner is not None:
