@@ -27,6 +27,7 @@ const MODAL_ID = 'agent-hub-modal';
 let _open = false;
 let _selectedTaskId = null;
 let _taskMap = new Map();            // taskId → full task object
+let _agents = [];                    // registered A2A agents
 let _eventSource = null;             // SSE connection
 let _fallbackPoll = null;            // polling fallback when SSE errors
 let _listTimerInterval = null;       // 1s tick for all visible row timers
@@ -97,6 +98,7 @@ function _getModal() {
       <div class="ah-body">
         <div class="ah-left-pane" id="ah-task-list">
           <div class="ah-stats-row" id="ah-stats-row"></div>
+          <div class="ah-agent-strip" id="ah-agent-strip"></div>
           <div class="ah-saved-filters" id="ah-saved-filters"></div>
           <div class="ah-list-toolbar">
             <input type="text" class="ah-filter ah-search-input" id="ah-search-input" placeholder="Search tasks…">
@@ -359,6 +361,20 @@ async function _fetchTasks(query) {
   }
 }
 
+async function _fetchAgents() {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent-hub/agents`, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    _agents = data.agents || [];
+    return _agents;
+  } catch (e) {
+    console.warn('Agent Hub: fetch agents failed', e);
+    _agents = [];
+    return [];
+  }
+}
+
 async function _fetchTask(taskId) {
   try {
     const res = await fetch(`${API_BASE}/api/agent-hub/tasks/${taskId}`, { credentials: 'same-origin' });
@@ -385,10 +401,11 @@ async function _fetchStatus() {
 async function _fetchAndRender() {
   const searchEl = document.getElementById('ah-search-input');
   const q = searchEl?.value.trim() || null;
-  await _fetchTasks(q);
+  await Promise.all([_fetchTasks(q), _fetchAgents()]);
   const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
   _renderStatsBar();
+  _renderAgentStrip();
   _renderFilterChips();
   _renderCoordinatorStatus();
   _updateBadge(tasks);
@@ -461,6 +478,7 @@ function _renderFromCache() {
   const tasks = _getFilteredTasks();
   _renderTaskList(tasks);
   _renderStatsBar();
+  _renderAgentStrip();
   _renderFilterChips();
   _updateBadge(tasks);
   _tickAllListTimers();  // populate fresh timer spans immediately
@@ -517,6 +535,25 @@ function _renderStatsBar() {
     <span class="ah-stat ah-stat--good">Terminal success ${_formatPct(stats.terminalSuccessRate)}</span>
     ${ownersHtml}
   `;
+}
+
+function _renderAgentStrip() {
+  const el = document.getElementById('ah-agent-strip');
+  if (!el) return;
+  if (!_agents.length) {
+    el.innerHTML = '<span class="ah-agent-empty">No A2A agents registered</span>';
+    return;
+  }
+  el.innerHTML = _agents.map(agent => {
+    const capabilities = (agent.capabilities || []).slice(0, 3).join(', ');
+    return `
+      <button class="ah-agent-chip" title="${_esc(capabilities || 'No capabilities')}">
+        <span class="ah-agent-dot ah-agent-dot--${_esc(agent.status || 'offline')}"></span>
+        <span class="ah-agent-name">${_esc(agent.name || agent.id)}</span>
+        <span class="ah-agent-kind">${_esc(agent.kind || '')}</span>
+      </button>
+    `;
+  }).join('');
 }
 
 // ── Saved filters (localStorage) ──────────────────────────────────────────────
@@ -759,6 +796,7 @@ function _renderTaskDetail(task) {
   const timelineItems = _buildTimelineItems(events, task);
   const timeline = timelineItems.map(item => _renderTimelineItem(item)).reverse().join('');
   const rawTimeline = events.map(e => _renderRawTimelineEvent(e)).reverse().join('');
+  const artifacts = events.filter(e => e.event_type === 'artifact' || e.artifact_type);
 
   const approvalCallout = task.status === 'waiting_for_approval'
     ? `<div class="ah-approval-callout">
@@ -787,6 +825,7 @@ function _renderTaskDetail(task) {
         ${task.approval_required ? '<span class="ah-detail-approval">Approval required</span>' : ''}
         ${task.locked_by ? `<span class="ah-detail-locked">Locked by ${_esc(task.locked_by)}</span>` : ''}
         ${task.attempt_count > 0 ? `<span class="ah-detail-attempts">Attempt ${task.attempt_count}</span>` : ''}
+        ${task.required_capabilities && task.required_capabilities.length ? `<span class="ah-detail-capabilities">Needs: ${task.required_capabilities.map(c => `<span class="ah-capability-tag">${_esc(c)}</span>`).join(' ')}</span>` : ''}
         <span class="ah-detail-sandbox ${task.sandbox_mode === 'danger-full-access' ? 'ah-detail-sandbox--danger' : ''}">Sandbox: ${_esc(task.sandbox_mode || 'workspace-write')}</span>
         <span class="ah-detail-timer" id="ah-running-timer" style="display:none"></span>
       </div>
@@ -822,6 +861,7 @@ function _renderTaskDetail(task) {
       <textarea class="ah-composer-input" id="ah-composer-input" placeholder="Add a comment or event…" rows="2"></textarea>
       <button class="ah-btn ah-btn-small" id="ah-add-event-btn">Add Event</button>
     </div>
+    ${_renderArtifactPanel(artifacts)}
     <div class="ah-timeline">
       <h4 class="ah-timeline-title">Timeline</h4>
       ${timeline || '<div class="ah-empty">No events yet.</div>'}
@@ -1094,6 +1134,9 @@ async function _showNewTaskForm() {
       <div class="ah-new-task-row">
         <input class="ah-input" id="ah-new-chain" placeholder="Triggered by task ID (optional)" value="" style="flex:1;">
       </div>
+      <div class="ah-new-task-row">
+        <input class="ah-input" id="ah-new-capabilities" placeholder="Required capabilities, comma-separated" value="" style="flex:1;">
+      </div>
       <div class="ah-new-task-row ah-new-task-row--sandbox">
         <label class="ah-sandbox-label">Sandbox:</label>
         <select class="ah-input ah-input--sandbox" id="ah-new-sandbox">
@@ -1152,9 +1195,13 @@ async function _showNewTaskForm() {
     const role = document.getElementById('ah-new-role')?.value || undefined;
     const priority = document.getElementById('ah-new-priority').value;
     const due_date = document.getElementById('ah-new-due-date')?.value || undefined;
-    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, priority, due_date, sandbox_mode: sandbox, tags: _newTags };
-    // Auto-queue if assigned to a non-user agent OR a role is set
-    if ((owner && owner !== 'user') || role) body.status = 'queued';
+    const required_capabilities = (document.getElementById('ah-new-capabilities')?.value || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, priority, due_date, sandbox_mode: sandbox, tags: _newTags, required_capabilities };
+    // Auto-queue if assigned, role-targeted, or capability-targeted.
+    if ((owner && owner !== 'user') || role || required_capabilities.length) body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);
     if (task) {
       if (chainId) {
@@ -1838,6 +1885,40 @@ function _buildTimelineItems(events, task) {
     });
   }
   return items;
+}
+
+function _formatArtifactSize(size) {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function _renderArtifactPanel(artifacts) {
+  if (!artifacts.length) return '';
+  const rows = artifacts.map(event => {
+    const meta = _parseEventMeta(event) || {};
+    const uri = meta.uri || meta.artifact_uri || '';
+    const size = _formatArtifactSize(event.artifact_size);
+    const details = [event.artifact_type, event.artifact_mime, size].filter(Boolean).join(' · ');
+    return `
+      <div class="ah-artifact-item">
+        <div class="ah-artifact-head">
+          <span class="ah-artifact-name">${_esc(event.summary || 'Artifact')}</span>
+          ${details ? `<span class="ah-artifact-meta">${_esc(details)}</span>` : ''}
+        </div>
+        ${uri ? `<a class="ah-artifact-uri" href="${_esc(uri)}" target="_blank" rel="noopener noreferrer">${_esc(uri)}</a>` : ''}
+        ${event.content ? `<pre class="ah-artifact-content">${_esc(event.content)}</pre>` : ''}
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="ah-artifacts">
+      <div class="ah-artifacts-title">Artifacts</div>
+      ${rows}
+    </div>
+  `;
 }
 
 function _renderTimelineMeta(meta) {

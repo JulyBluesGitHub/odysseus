@@ -10,15 +10,17 @@ Route convention: ``setup_agent_hub_routes() -> APIRouter`` (matches the existin
 
 import json
 import logging
+import secrets
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Query
+import bcrypt
+from fastapi import APIRouter, Header, HTTPException, Request, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from core.database import SessionLocal, AgentTask, AgentEvent, WorkflowTemplate
+from core.database import SessionLocal, AgentTask, AgentEvent, WorkflowTemplate, AgentInstance
 from sqlalchemy import or_
 from src.auth_helpers import get_current_user
 
@@ -48,8 +50,8 @@ TRANSITIONS: dict[str, set[str]] = {
 }
 
 VALID_ACTORS = {"user", "hermes", "codex", "cursor", "coordinator"}
-VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock", "context"}
-VALID_OWNERS = {"user", "hermes", "codex", "cursor"}
+VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock", "context", "artifact"}
+VALID_OWNERS = {"user", "hermes", "codex", "cursor", "mock"}
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_ROLES = {"diagnoser", "implementer", "verifier"}
 VALID_PRIORITIES = {"high", "medium", "low"}
@@ -73,6 +75,7 @@ class TaskCreate(BaseModel):
     schedule_type: Optional[str] = None    # 'once', 'interval', 'cron'
     schedule_expr: Optional[str] = None    # '30m', 'every 2h', '0 9 * * *', ISO ts
     allow_overlap: bool = False
+    required_capabilities: list[str] = []
 
 
 class TaskUpdate(BaseModel):
@@ -93,6 +96,7 @@ class TaskUpdate(BaseModel):
     schedule_type: Optional[str] = None
     schedule_expr: Optional[str] = None
     allow_overlap: Optional[bool] = None
+    required_capabilities: Optional[list[str]] = None
 
 
 class EventCreate(BaseModel):
@@ -101,6 +105,9 @@ class EventCreate(BaseModel):
     summary: Optional[str] = None
     content: Optional[str] = None
     metadata_json: Optional[str] = None
+    artifact_type: Optional[str] = None
+    artifact_mime: Optional[str] = None
+    artifact_size: Optional[int] = None
 
 
 class AssignRequest(BaseModel):
@@ -130,6 +137,22 @@ class TemplateUpdate(BaseModel):
 
 class TemplateInstantiate(BaseModel):
     title: str
+
+
+class AgentRegister(BaseModel):
+    id: Optional[str] = None
+    name: str
+    kind: str = "cli"
+    adapter_name: Optional[str] = None
+    status: str = "online"
+    capabilities: list[str] = []
+    endpoint: Optional[str] = None
+    agent_card_json: Optional[dict] = None
+
+
+class AgentHeartbeat(BaseModel):
+    id: str
+    status: str = "online"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -173,6 +196,12 @@ def _task_to_dict(t: AgentTask) -> dict:
         "allow_overlap": t.allow_overlap,
         "scheduled_template_id": t.scheduled_template_id,
         "scheduled_run_at": t.scheduled_run_at.isoformat() + "Z" if t.scheduled_run_at else None,
+        "agent_instance_id": t.agent_instance_id,
+        "external_protocol": t.external_protocol,
+        "external_task_id": t.external_task_id,
+        "agent_card_url": t.agent_card_url,
+        "response_to_task_id": t.response_to_task_id,
+        "required_capabilities": t.required_capabilities or [],
         "started_at": started,
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
@@ -189,6 +218,9 @@ def _event_to_dict(e: AgentEvent) -> dict:
         "summary": e.summary,
         "content": e.content,
         "metadata_json": e.metadata_json,
+        "artifact_type": e.artifact_type,
+        "artifact_mime": e.artifact_mime,
+        "artifact_size": e.artifact_size,
         "created_at": e.created_at.isoformat() + "Z" if e.created_at else None,
     }
 
@@ -202,6 +234,53 @@ def _template_to_dict(t: WorkflowTemplate) -> dict:
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
     }
+
+
+def _agent_to_dict(agent: AgentInstance) -> dict:
+    return {
+        "id": agent.id,
+        "owner": agent.owner,
+        "name": agent.name,
+        "kind": agent.kind,
+        "adapter_name": agent.adapter_name,
+        "status": agent.status,
+        "capabilities": agent.capabilities or [],
+        "endpoint": agent.endpoint,
+        "last_heartbeat": agent.last_heartbeat.isoformat() + "Z" if agent.last_heartbeat else None,
+        "agent_card_json": agent.agent_card_json,
+        "created_at": agent.created_at.isoformat() + "Z" if agent.created_at else None,
+        "updated_at": agent.updated_at.isoformat() + "Z" if agent.updated_at else None,
+    }
+
+
+def _hash_agent_token(token: str) -> str:
+    return bcrypt.hashpw(token.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_agent_token(token: str | None, token_hash: str | None) -> bool:
+    if not token or not token_hash:
+        return False
+    try:
+        return bcrypt.checkpw(token.encode("utf-8"), token_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _require_agent_token(agent: AgentInstance, token: str | None) -> None:
+    if not _verify_agent_token(token, agent.auth_token_hash):
+        raise HTTPException(401, "Invalid agent token")
+
+
+def _is_valid_adapter_name(adapter_name: str | None) -> bool:
+    if not adapter_name:
+        return True
+    if adapter_name in (VALID_OWNERS - {"user"}):
+        return True
+    try:
+        from src.agent_coordinator import _adapter_registry
+        return adapter_name in _adapter_registry
+    except Exception:
+        return False
 
 
 def _normalize_template_steps(steps: list[TemplateStep]) -> list[dict]:
@@ -358,6 +437,131 @@ def setup_agent_hub_routes() -> APIRouter:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # ── A2A Agent Registry ────────────────────────────────────────────────
+
+    @router.get("/agents")
+    async def list_agents(request: Request):
+        """List A2A agent instances visible to the current user."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            qobj = db.query(AgentInstance)
+            if user:
+                qobj = qobj.filter(AgentInstance.owner == user)
+            else:
+                qobj = qobj.filter(AgentInstance.owner == None)  # noqa: E711
+            agents = qobj.order_by(AgentInstance.updated_at.desc()).all()
+            return {"agents": [_agent_to_dict(agent) for agent in agents]}
+        finally:
+            db.close()
+
+    @router.post("/agents/register", status_code=201)
+    async def register_agent(
+        request: Request,
+        body: AgentRegister,
+        x_agent_token: Optional[str] = Header(None),
+    ):
+        """Create or update an A2A agent instance.
+
+        First registration stores the supplied token, or generates one if none
+        was supplied. Re-registration requires the existing token.
+        """
+        user = get_current_user(request)
+        agent_id = (body.id or str(uuid.uuid4())).strip()
+        if not agent_id:
+            raise HTTPException(400, "Agent id is required")
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(400, "Agent name is required")
+        if body.kind not in {"cli", "sdk", "http", "a2a-remote"}:
+            raise HTTPException(400, f"Invalid agent kind: {body.kind}")
+        if body.status not in {"online", "offline", "busy"}:
+            raise HTTPException(400, f"Invalid agent status: {body.status}")
+        if not _is_valid_adapter_name(body.adapter_name):
+            raise HTTPException(400, f"Invalid adapter_name: {body.adapter_name}")
+
+        db = SessionLocal()
+        try:
+            agent = db.query(AgentInstance).filter(AgentInstance.id == agent_id).first()
+            created = agent is None
+            raw_token = x_agent_token or secrets.token_urlsafe(32)
+            if agent:
+                if user and agent.owner != user:
+                    raise HTTPException(404, "Agent not found")
+                _require_agent_token(agent, x_agent_token)
+            else:
+                agent = AgentInstance(
+                    id=agent_id,
+                    owner=user,
+                    auth_token_hash=_hash_agent_token(raw_token),
+                    last_heartbeat=datetime.utcnow(),
+                )
+                db.add(agent)
+
+            agent.name = name
+            agent.kind = body.kind
+            agent.adapter_name = body.adapter_name
+            agent.status = body.status
+            agent.capabilities = list(body.capabilities or [])
+            agent.endpoint = body.endpoint
+            agent.agent_card_json = body.agent_card_json
+            if body.status == "online":
+                agent.last_heartbeat = datetime.utcnow()
+
+            db.commit()
+            db.refresh(agent)
+            result = _agent_to_dict(agent)
+            if created:
+                result["token"] = raw_token
+            return result
+        finally:
+            db.close()
+
+    @router.post("/agents/heartbeat")
+    async def heartbeat_agent(
+        body: AgentHeartbeat,
+        x_agent_token: Optional[str] = Header(None),
+    ):
+        """Update an agent heartbeat and mark it online/busy."""
+        if body.status not in {"online", "busy"}:
+            raise HTTPException(400, f"Invalid heartbeat status: {body.status}")
+        db = SessionLocal()
+        try:
+            agent = db.query(AgentInstance).filter(AgentInstance.id == body.id).first()
+            if not agent:
+                raise HTTPException(404, "Agent not found")
+            _require_agent_token(agent, x_agent_token)
+            agent.status = body.status
+            agent.last_heartbeat = datetime.utcnow()
+            db.commit()
+            db.refresh(agent)
+            return _agent_to_dict(agent)
+        finally:
+            db.close()
+
+    @router.post("/agents/mark-stale-offline")
+    async def mark_stale_agents_offline(request: Request):
+        """Mark agents offline when heartbeat is older than 90 seconds."""
+        get_current_user(request)
+        cutoff = datetime.utcnow() - timedelta(seconds=90)
+        db = SessionLocal()
+        try:
+            stale = (
+                db.query(AgentInstance)
+                .filter(
+                    AgentInstance.status != "offline",
+                    AgentInstance.last_heartbeat.isnot(None),
+                    AgentInstance.last_heartbeat < cutoff,
+                )
+                .all()
+            )
+            for agent in stale:
+                agent.status = "offline"
+            db.commit()
+            return {"updated": len(stale)}
+        finally:
+            db.close()
 
     # ── Workflow Templates ────────────────────────────────────────────────
 
@@ -600,7 +804,7 @@ def setup_agent_hub_routes() -> APIRouter:
             raise HTTPException(400, f"Invalid status: {body.status}")
         if body.priority not in VALID_PRIORITIES:
             raise HTTPException(400, f"Invalid priority: {body.priority}")
-        if body.current_owner and body.current_owner not in VALID_OWNERS:
+        if body.current_owner and body.current_owner != "user" and not _is_valid_adapter_name(body.current_owner):
             raise HTTPException(400, f"Invalid current_owner: {body.current_owner}")
         if body.sandbox_mode not in VALID_SANDBOX_MODES:
             raise HTTPException(400, f"Invalid sandbox_mode: {body.sandbox_mode}")
@@ -712,6 +916,7 @@ def setup_agent_hub_routes() -> APIRouter:
                 schedule_expr=body.schedule_expr,
                 next_run_at=next_run_at,
                 allow_overlap=body.allow_overlap,
+                required_capabilities=body.required_capabilities,
             )
             db.add(task)
             db.commit()
@@ -776,7 +981,11 @@ def setup_agent_hub_routes() -> APIRouter:
             if body.phase is not None:
                 task.phase = body.phase
             if body.current_owner is not None:
-                if body.current_owner not in VALID_OWNERS and body.current_owner != "":
+                if (
+                    body.current_owner
+                    and body.current_owner != "user"
+                    and not _is_valid_adapter_name(body.current_owner)
+                ):
                     raise HTTPException(400, f"Invalid current_owner: {body.current_owner}")
                 task.current_owner = body.current_owner if body.current_owner else None
             if body.approval_required is not None:
@@ -817,6 +1026,8 @@ def setup_agent_hub_routes() -> APIRouter:
                         task.next_run_at = compute_next_interval(task.schedule_expr)
             if body.allow_overlap is not None:
                 task.allow_overlap = body.allow_overlap
+            if body.required_capabilities is not None:
+                task.required_capabilities = body.required_capabilities
 
             db.commit()
             db.refresh(task)
@@ -921,6 +1132,9 @@ def setup_agent_hub_routes() -> APIRouter:
                 db, task_id, body.actor, body.event_type,
                 summary=body.summary, content=body.content,
                 metadata_json=body.metadata_json,
+                artifact_type=body.artifact_type,
+                artifact_mime=body.artifact_mime,
+                artifact_size=body.artifact_size,
             )
             db.commit()
             db.refresh(event)
@@ -932,13 +1146,40 @@ def setup_agent_hub_routes() -> APIRouter:
         finally:
             db.close()
 
+    @router.get("/tasks/{task_id}/artifacts")
+    async def list_task_artifacts(request: Request, task_id: str):
+        """List typed artifacts attached to a task timeline."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
+            if not task:
+                raise HTTPException(404, "Task not found")
+            if user and task.owner and task.owner != user:
+                raise HTTPException(404, "Task not found")
+            events = (
+                db.query(AgentEvent)
+                .filter(
+                    AgentEvent.task_id == task_id,
+                    or_(
+                        AgentEvent.event_type == "artifact",
+                        AgentEvent.artifact_type.isnot(None),
+                    ),
+                )
+                .order_by(AgentEvent.created_at.asc())
+                .all()
+            )
+            return {"artifacts": [_event_to_dict(e) for e in events]}
+        finally:
+            db.close()
+
     # ── Actions ───────────────────────────────────────────────────────────
 
     @router.post("/tasks/{task_id}/assign")
     async def assign_task(request: Request, task_id: str, body: AssignRequest):
         """Assign a task to an agent (user | hermes | codex | cursor)."""
         user = get_current_user(request)
-        if body.current_owner not in VALID_OWNERS:
+        if body.current_owner != "user" and not _is_valid_adapter_name(body.current_owner):
             raise HTTPException(400, f"Invalid current_owner: {body.current_owner}")
 
         db = SessionLocal()
@@ -1077,7 +1318,7 @@ def setup_agent_hub_routes() -> APIRouter:
 
         if not role or role not in VALID_ROLES:
             raise HTTPException(400, f"Invalid role: {role}")
-        if adapter and adapter not in VALID_OWNERS:
+        if adapter and adapter != "user" and not _is_valid_adapter_name(adapter):
             raise HTTPException(400, f"Invalid adapter_name: {adapter}")
 
         db = SessionLocal()
@@ -1366,7 +1607,10 @@ def setup_agent_hub_routes() -> APIRouter:
 def _record_event(db, task_id: str, actor: str, event_type: str, *,
                    summary: str | None = None,
                    content: str | None = None,
-                   metadata_json: str | None = None) -> AgentEvent:
+                   metadata_json: str | None = None,
+                   artifact_type: str | None = None,
+                   artifact_mime: str | None = None,
+                   artifact_size: int | None = None) -> AgentEvent:
     """Create and flush an AgentEvent. Caller must commit the session."""
     event = AgentEvent(
         id=str(uuid.uuid4()),
@@ -1376,6 +1620,9 @@ def _record_event(db, task_id: str, actor: str, event_type: str, *,
         summary=summary,
         content=content,
         metadata_json=metadata_json,
+        artifact_type=artifact_type,
+        artifact_mime=artifact_mime,
+        artifact_size=artifact_size,
     )
     db.add(event)
     db.flush()

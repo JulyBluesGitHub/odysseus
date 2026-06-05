@@ -86,6 +86,9 @@ class AgentAdapterResult:
     proposed_owner: str | None = None
     """Suggested next owner (e.g. 'user', 'hermes')."""
 
+    agent_instance_id: str | None = None
+    """A2A agent instance identity associated with this result, if any."""
+
     needs_approval: bool = False
     """If True, the coordinator sets approval_required on the task."""
 

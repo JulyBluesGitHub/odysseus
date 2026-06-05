@@ -21451,6 +21451,41 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-stat--warn { color: #f0a030; }
 .ah-stat--good { color: #44aa44; }
 .ah-stat--bad { color: #cc4444; }
+.ah-agent-strip {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 5px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.ah-agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  color: var(--fg);
+  font-size: 10px;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.ah-agent-name { overflow: hidden; text-overflow: ellipsis; }
+.ah-agent-kind { opacity: 0.48; }
+.ah-agent-empty { font-size: 10px; opacity: 0.45; }
+.ah-agent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #888;
+  flex: 0 0 auto;
+}
+.ah-agent-dot--online { background: #44aa44; }
+.ah-agent-dot--busy { background: #f0a030; }
+.ah-agent-dot--offline { background: #888; }
 .ah-saved-filters {
   display: flex;
   gap: 4px;
@@ -21561,6 +21596,17 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-detail-actions { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
 .ah-detail-phase { text-transform: capitalize; }
 .ah-detail-owner { text-transform: capitalize; }
+.ah-detail-capabilities { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.ah-capability-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, #5b8abf 55%, transparent);
+  color: #5b8abf;
+  font-size: 10px;
+  line-height: 1.4;
+}
 .ah-owner-tag {
   display: inline-block; padding: 1px 8px; border-radius: 3px;
   font-size: 10px; font-weight: 500; text-transform: capitalize;
@@ -21568,6 +21614,38 @@ body:not(.welcome-ready) #welcome-screen {
 }
 .ah-composer { display: flex; gap: 6px; margin-bottom: 10px; }
 .ah-composer-input { flex: 1; font-size: 12px; padding: 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; resize: vertical; font-family: inherit; }
+.ah-artifacts {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  margin-bottom: 10px;
+}
+.ah-artifacts-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.ah-artifact-item {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  margin-bottom: 6px;
+}
+.ah-artifact-head { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.ah-artifact-name { font-size: 12px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ah-artifact-meta { font-size: 10px; opacity: 0.55; flex-shrink: 0; }
+.ah-artifact-uri { display: block; margin-top: 4px; font-size: 10px; color: var(--accent, #5b8abf); overflow-wrap: anywhere; }
+.ah-artifact-content {
+  max-height: 140px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
 .ah-chain-row { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; }
 .ah-chain-direction { font-size: 11px; opacity: 0.5; flex-shrink: 0; }
 .ah-chain-label { font-size: 11px; opacity: 0.8; }
@@ -21622,6 +21700,11 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-timeline-item--approval {
   border-left: 2px solid #44aa44;
   padding-left: 8px;
+}
+.ah-timeline-item--artifact {
+  border-left: 2px solid #5b8abf;
+  padding-left: 8px;
+  background: color-mix(in srgb, #5b8abf 4%, transparent);
 }
 .ah-event-header { display: flex; gap: 8px; font-size: 10px; opacity: 0.6; margin-bottom: 2px; }
 .ah-event-actor { font-weight: 600; text-transform: capitalize; }

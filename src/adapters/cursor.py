@@ -79,6 +79,18 @@ class CursorAdapter(AbstractAdapter):
 
         try:
             cursor_sdk = importlib.import_module("cursor_sdk")
+
+            # Check if the SDK has real error types (not mock fallbacks).
+            # When the module is mocked for tests, these will all be missing
+            # or set to Exception — skip granular handling in that case.
+            _HAS_ERROR_TYPES = all(
+                getattr(cursor_sdk, name, None) is not None
+                for name in (
+                    "APITimeoutError", "InternalServerError", "NetworkError",
+                    "PermissionDeniedError", "AuthenticationError",
+                )
+            )
+
             Agent = cursor_sdk.Agent
             AgentOptions = cursor_sdk.AgentOptions
             LocalAgentOptions = cursor_sdk.LocalAgentOptions
@@ -99,6 +111,52 @@ class CursorAdapter(AbstractAdapter):
                 needs_approval=False,
             )
         except Exception as exc:
+            if not _HAS_ERROR_TYPES:
+                # Mock mode or missing error types — broad handling
+                logger.exception("Cursor adapter failed")
+                return _blocked(f"Cursor error: {exc}", str(exc))
+
+            # Granular error handling with workarounds for cursor-sdk's
+            # buggy error hierarchy (see cursor-sdk-bugs-batch-2.md).
+            if isinstance(exc, cursor_sdk.APITimeoutError):
+                logger.warning("Cursor adapter timeout — retrying")
+                return AgentAdapterResult(
+                    summary=f"Timeout: {exc}",
+                    content=str(exc),
+                    proposed_status="queued",
+                    needs_approval=False,
+                )
+            # InternalServerError must come BEFORE NetworkError — cursor-sdk
+            # bug: InternalServerError inherits NetworkError (500 is not a
+            # network failure, but the hierarchy says it is).
+            if isinstance(exc, cursor_sdk.InternalServerError):
+                logger.exception("Cursor adapter server error")
+                return _blocked(f"Cursor server error: {exc}", str(exc))
+            if isinstance(exc, cursor_sdk.NetworkError):
+                logger.warning("Cursor adapter network error — retrying")
+                return AgentAdapterResult(
+                    summary=f"Network error: {exc}",
+                    content=str(exc),
+                    proposed_status="queued",
+                    needs_approval=False,
+                )
+            # PermissionDeniedError must come BEFORE AuthenticationError —
+            # cursor-sdk bug: 403 inherits from 401.
+            if isinstance(exc, cursor_sdk.PermissionDeniedError):
+                return _blocked(f"Access denied: {exc}", str(exc))
+            if isinstance(exc, cursor_sdk.AuthenticationError):
+                return _blocked(f"Auth error: {exc}", str(exc))
+            if isinstance(exc, cursor_sdk.RateLimitError):
+                logger.warning("Cursor adapter rate limited — retrying")
+                return AgentAdapterResult(
+                    summary=f"Rate limited: {exc}",
+                    content=str(exc),
+                    proposed_status="queued",
+                    needs_approval=False,
+                )
+            if isinstance(exc, cursor_sdk.ConfigurationError):
+                return _blocked(f"Configuration error: {exc}", str(exc))
+
             logger.exception("Cursor adapter failed")
             return _blocked(f"Cursor error: {exc}", str(exc))
 

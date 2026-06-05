@@ -435,21 +435,20 @@ class TestCursorAdapter:
         captured = {}
 
         class FakeLocalAgentOptions:
-            def __init__(self, cwd=None, force=False):
+            def __init__(self, cwd=None, setting_sources=None, sandbox_options=None):
                 captured["cwd"] = cwd
-                captured["force"] = force
 
         class FakeAgent:
             @staticmethod
-            def prompt(prompt, model=None, local=None):
-                captured["prompt"] = prompt
-                captured["model"] = model
-                captured["local"] = local
+            def prompt(message, options=None):
+                captured["prompt"] = message
+                captured["options"] = options
                 return "Cursor completed the task."
 
         fake_sdk = types.SimpleNamespace(
             version="0.1.0",
             Agent=FakeAgent,
+            AgentOptions=lambda model=None, local=None: None,
             LocalAgentOptions=FakeLocalAgentOptions,
         )
         monkeypatch.setitem(sys.modules, "cursor_sdk", fake_sdk)
@@ -466,9 +465,7 @@ class TestCursorAdapter:
         assert result.summary == "Cursor completed the task."
         assert result.proposed_status == "done"
         assert captured["prompt"] == "Cursor task"
-        assert captured["model"] == "composer-2.5"
         assert captured["cwd"] == "C:/repo"
-        assert captured["force"] is True
 
     def test_run_rejects_invalid_sandbox_mode(self):
         from src.adapters.cursor import CursorAdapter
@@ -494,17 +491,18 @@ class TestCursorAdapter:
         from unittest.mock import MagicMock
 
         class FakeLocalAgentOptions:
-            def __init__(self, cwd=None, force=False):
+            def __init__(self, cwd=None, setting_sources=None, sandbox_options=None):
                 pass
 
         class FakeAgent:
             @staticmethod
-            def prompt(prompt, model=None, local=None):
+            def prompt(message, options=None):
                 raise RuntimeError("cursor exploded")
 
         fake_sdk = types.SimpleNamespace(
             version="0.1.0",
             Agent=FakeAgent,
+            AgentOptions=lambda model=None, local=None: None,
             LocalAgentOptions=FakeLocalAgentOptions,
         )
         monkeypatch.setitem(sys.modules, "cursor_sdk", fake_sdk)

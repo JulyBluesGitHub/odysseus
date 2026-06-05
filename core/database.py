@@ -611,10 +611,51 @@ class AgentTask(TimestampMixin, Base):
     # FK → agent_tasks.id (set on clones, NOT templates)
     scheduled_run_at  = Column(DateTime, nullable=True)
     # the next_run_at that triggered this clone
+    agent_instance_id = Column(String, nullable=True, index=True)
+    # A2A identity that owns the task lifecycle; distinct from owner/current_owner
+    external_protocol = Column(String, nullable=True)
+    # Wire protocol at the boundary, e.g. "a2a"
+    external_task_id  = Column(String, nullable=True, index=True)
+    # Remote/protocol task id when bridged through A2A
+    agent_card_url    = Column(String, nullable=True)
+    # Source AgentCard URL used to create/dispatch this task
+    response_to_task_id = Column(String, nullable=True, index=True)
+    # Optional parent task waiting for this task's response
+    required_capabilities = Column(JSON, default=list, nullable=False)
+    # Capability IDs required for capability-based dispatch
 
     __table_args__ = (
         Index('ix_agent_tasks_status_owner', 'status', 'owner'),
         Index('ix_agent_tasks_next_run', 'status', 'next_run_at'),
+    )
+
+
+class AgentInstance(TimestampMixin, Base):
+    """Registered A2A agent identity.
+
+    Keep these identity layers separate:
+    owner = authenticated user scope, adapter_name = local execution backend,
+    id = A2A agent instance identity.
+    """
+    __tablename__ = "agent_instances"
+
+    id              = Column(String, primary_key=True, index=True)
+    owner           = Column(String, nullable=True, index=True)
+    name            = Column(String, nullable=False)
+    kind            = Column(String, nullable=False, default="cli")
+    # cli | sdk | http | a2a-remote
+    adapter_name    = Column(String, nullable=True, index=True)
+    # hermes | codex | cursor | None for remote A2A agents
+    status          = Column(String, nullable=False, default="offline", index=True)
+    # online | offline | busy
+    capabilities    = Column(JSON, default=list, nullable=False)
+    endpoint        = Column(String, nullable=True)
+    auth_token_hash = Column(String, nullable=True)
+    last_heartbeat  = Column(DateTime, nullable=True)
+    agent_card_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index('ix_agent_instances_owner_status', 'owner', 'status'),
     )
 
 
@@ -670,6 +711,9 @@ class AgentEvent(TimestampMixin, Base):
     summary       = Column(Text, nullable=True)
     content       = Column(Text, nullable=True)           # full adapter output / message body
     metadata_json = Column(Text, nullable=True)           # JSON blob for structured adapter data
+    artifact_type = Column(String, nullable=True)
+    artifact_mime = Column(String, nullable=True)
+    artifact_size = Column(Integer, nullable=True)
 
     task = relationship("AgentTask", backref=backref("events", cascade="all, delete-orphan",
                          order_by="AgentEvent.created_at"))
@@ -1703,6 +1747,9 @@ def init_db():
     _migrate_add_agent_task_priority_column()
     _migrate_add_agent_task_due_date_column()
     _migrate_add_agent_task_schedule_columns()
+    _migrate_add_a2a_agent_columns()
+    _migrate_add_agent_artifact_columns()
+    _migrate_add_agent_instances_table()
     _migrate_add_workflow_templates_table()
     _migrate_agent_search_fts()
 
@@ -1946,6 +1993,73 @@ def _migrate_add_agent_task_schedule_columns():
         logging.getLogger(__name__).info("Migrated: added schedule columns to agent_tasks")
     except OperationalError as e:
         logging.getLogger(__name__).warning(f"agent_tasks schedule index migration: {e}")
+
+
+def _migrate_add_a2a_agent_columns():
+    """Add A2A compatibility metadata columns to agent_tasks."""
+    _add_column_if_missing("agent_tasks", "agent_instance_id", "TEXT")
+    _add_column_if_missing("agent_tasks", "external_protocol", "TEXT")
+    _add_column_if_missing("agent_tasks", "external_task_id", "TEXT")
+    _add_column_if_missing("agent_tasks", "agent_card_url", "TEXT")
+    _add_column_if_missing("agent_tasks", "response_to_task_id", "TEXT")
+    _add_column_if_missing("agent_tasks", "required_capabilities", "JSON NOT NULL DEFAULT '[]'")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_tasks_agent_instance_id "
+                "ON agent_tasks (agent_instance_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_tasks_external_task_id "
+                "ON agent_tasks (external_task_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_tasks_response_to_task_id "
+                "ON agent_tasks (response_to_task_id)"
+            ))
+    except OperationalError as e:
+        logging.getLogger(__name__).warning(f"agent_tasks A2A index migration: {e}")
+
+
+def _migrate_add_agent_artifact_columns():
+    """Add typed artifact metadata columns to agent_events."""
+    _add_column_if_missing("agent_events", "artifact_type", "TEXT")
+    _add_column_if_missing("agent_events", "artifact_mime", "TEXT")
+    _add_column_if_missing("agent_events", "artifact_size", "INTEGER")
+
+
+def _migrate_add_agent_instances_table():
+    """Create the A2A agent_instances registry table if it does not exist."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS agent_instances (
+                    id TEXT NOT NULL,
+                    owner TEXT,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'cli',
+                    adapter_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'offline',
+                    capabilities JSON NOT NULL DEFAULT '[]',
+                    endpoint TEXT,
+                    auth_token_hash TEXT,
+                    last_heartbeat TIMESTAMP,
+                    agent_card_json JSON,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    PRIMARY KEY (id)
+                )
+            """))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_instances_owner_status "
+                "ON agent_instances (owner, status)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_instances_adapter_name "
+                "ON agent_instances (adapter_name)"
+            ))
+    except OperationalError as e:
+        logging.getLogger(__name__).warning(f"agent_instances migration failed: {e}")
 
 
 def _add_column_if_missing(table: str, column: str, col_type: str):

@@ -25,7 +25,8 @@ import os
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from core.database import SessionLocal, AgentTask, AgentEvent
+import core.database as _database
+from core.database import SessionLocal, AgentTask, AgentEvent, AgentInstance
 from src.agent_hub_events import publish as _publish_event
 from src.task_scheduler import compute_next_run, compute_next_interval, _utcnow
 from sqlalchemy import or_
@@ -69,7 +70,7 @@ _running_total = 0
 def _publish_task(task_id: str) -> None:
     """Re-fetch a task from DB and publish a task_updated event to its owner."""
     from src.agent_hub_events import _task_to_ssedict
-    db = SessionLocal()
+    db = _new_session()
     try:
         task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
         if task:
@@ -218,6 +219,12 @@ _running = False
 _last_tick: datetime | None = None
 _tasks_processed = 0
 _adapter_registry: dict[str, object] = {}  # owner_name → adapter instance
+_wakeup_requested = asyncio.Event()
+_wakeup_lock = asyncio.Lock()
+
+
+def _new_session():
+    return _database.SessionLocal()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -287,6 +294,15 @@ def get_status() -> dict:
             "by_role": dict(_running_by_role),
         },
     }
+
+
+def request_wakeup() -> None:
+    """Signal the coordinator loop to tick soon.
+
+    Route handlers call this after creating work for an online agent. The loop
+    coalesces rapid requests and guards `_tick()` with a single-flight lock.
+    """
+    _wakeup_requested.set()
 
 
 # ── Cap helpers ────────────────────────────────────────────────────────────────
@@ -451,6 +467,10 @@ def _build_role_context_brief(db, task) -> str | None:
     lines.append(f"**Task:** {task.title}")
     if task.objective:
         lines.append(f"**Objective:** {task.objective}")
+    if getattr(task, "agent_instance_id", None):
+        lines.append(f"**From Agent:** {task.agent_instance_id}")
+    if getattr(task, "external_protocol", None):
+        lines.append(f"**External Protocol:** {task.external_protocol}")
     lines.append("")
 
     # ── Role-specific sections ──
@@ -575,13 +595,26 @@ async def _coordinator_loop():
 
     while _running:
         try:
-            _last_tick = datetime.now(timezone.utc)
-            await _tick()
+            async with _wakeup_lock:
+                _last_tick = datetime.now(timezone.utc)
+                await _mark_stale_agents_offline()
+                await _tick()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Agent Hub coordinator tick failed")
-        await asyncio.sleep(POLL_INTERVAL)
+
+        sleep_task = asyncio.create_task(asyncio.sleep(POLL_INTERVAL))
+        wake_task = asyncio.create_task(_wakeup_requested.wait())
+        try:
+            await asyncio.wait(
+                {sleep_task, wake_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            sleep_task.cancel()
+            wake_task.cancel()
+        _wakeup_requested.clear()
 
 
 async def _tick():
@@ -597,7 +630,7 @@ async def _tick():
     """
     global _tasks_processed
 
-    db = SessionLocal()
+    db = _new_session()
     try:
         # Phase 0: Activate due scheduled tasks BEFORE the claim loop
         await _activate_due_scheduled(db)
@@ -611,6 +644,7 @@ async def _tick():
                 or_(
                     AgentTask.current_owner.in_(_adapter_registry.keys()),
                     AgentTask.role.isnot(None),
+                    AgentTask.required_capabilities.isnot(None),
                 ),
             )
             .order_by(AgentTask.created_at)
@@ -620,9 +654,29 @@ async def _tick():
         if not candidates:
             return
 
-        # Filter: resolve roles, check deps, check caps
         eligible = []
         for task in candidates:
+            if task.required_capabilities and not task.current_owner:
+                agent = _match_by_capability(db, task)
+                if not agent:
+                    _block_task(
+                        db,
+                        task,
+                        "No online agent matches required capabilities: "
+                        + ", ".join(task.required_capabilities or []),
+                    )
+                    continue
+                matched_adapter = agent.adapter_name or "a2a"
+                task.current_owner = matched_adapter
+                task.agent_instance_id = agent.id
+                _record_event(
+                    db, task.id, "coordinator", "status_change",
+                    summary=(
+                        f"Matched capabilities {', '.join(task.required_capabilities or [])} "
+                        f"to agent {agent.name} ({matched_adapter})"
+                    ),
+                )
+
             # Resolve role
             if task.role:
                 if task.role not in VALID_ROLES:
@@ -695,7 +749,7 @@ async def _tick():
             result = None
             error_msg = f"{type(exc).__name__}: {exc}"
 
-        db2 = SessionLocal()
+        db2 = _new_session()
         try:
             t = db2.query(AgentTask).filter(AgentTask.id == task.id).first()
             if not t:
@@ -717,12 +771,26 @@ async def _tick():
                 else:
                     t.status = "queued"
             else:
+                if result.agent_instance_id:
+                    t.agent_instance_id = result.agent_instance_id
+                if result.metadata and result.metadata.get("external_task_id"):
+                    t.external_task_id = str(result.metadata["external_task_id"])
                 _record_event(
                     db2, t.id, task.current_owner, "message",
                     summary=result.summary,
                     content=result.content,
                     metadata_json=_safe_json_dump(_enrich_metadata(result)),
                 )
+                for artifact in _extract_result_artifacts(result):
+                    _record_event(
+                        db2, t.id, task.current_owner, "artifact",
+                        summary=artifact.get("name") or artifact.get("summary") or "Artifact",
+                        content=artifact.get("content"),
+                        metadata_json=_safe_json_dump(artifact.get("metadata") or {}),
+                        artifact_type=artifact.get("type"),
+                        artifact_mime=artifact.get("mime_type") or artifact.get("mime"),
+                        artifact_size=artifact.get("size"),
+                    )
                 _execute_create_task_actions(db2, t, result.actions)
 
                 if result.needs_approval:
@@ -770,10 +838,61 @@ async def _tick():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+async def _mark_stale_agents_offline() -> None:
+    """Mark registered agents offline after missed heartbeats."""
+    from core.database import AgentInstance
+
+    db = _new_session()
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=90)
+        stale = (
+            db.query(AgentInstance)
+            .filter(
+                AgentInstance.status != "offline",
+                AgentInstance.last_heartbeat.isnot(None),
+                AgentInstance.last_heartbeat < cutoff,
+            )
+            .all()
+        )
+        if not stale:
+            return
+        for agent in stale:
+            agent.status = "offline"
+        db.commit()
+    except Exception:
+        logger.exception("Agent Hub: failed to mark stale agents offline")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _match_by_capability(db, task) -> AgentInstance | None:
+    """Return an online agent whose capabilities cover task requirements."""
+    required = [str(c).strip() for c in (task.required_capabilities or []) if str(c).strip()]
+    if not required:
+        return None
+    required_set = set(required)
+    candidates = (
+        db.query(AgentInstance)
+        .filter(
+            AgentInstance.status == "online",
+            or_(AgentInstance.owner == task.owner, AgentInstance.owner == None),  # noqa: E711
+        )
+        .order_by(AgentInstance.owner.desc(), AgentInstance.updated_at.desc())
+        .all()
+    )
+    for agent in candidates:
+        adapter_name = agent.adapter_name or ("a2a" if agent.kind == "a2a-remote" else None)
+        if adapter_name not in _adapter_registry:
+            continue
+        if required_set.issubset(set(agent.capabilities or [])):
+            return agent
+    return None
+
 def _load_events(task_id: str) -> list:
     """Load events for a task (chronological). Returns empty list on error."""
     try:
-        db = SessionLocal()
+        db = _new_session()
         try:
             return (
                 db.query(AgentEvent)
@@ -790,7 +909,10 @@ def _load_events(task_id: str) -> list:
 def _record_event(db, task_id: str, actor: str, event_type: str, *,
                    summary: str | None = None,
                    content: str | None = None,
-                   metadata_json: str | None = None) -> AgentEvent:
+                   metadata_json: str | None = None,
+                   artifact_type: str | None = None,
+                   artifact_mime: str | None = None,
+                   artifact_size: int | None = None) -> AgentEvent:
     """Create and flush an AgentEvent. Caller must commit the session."""
     event = AgentEvent(
         id=str(uuid.uuid4()),
@@ -800,6 +922,9 @@ def _record_event(db, task_id: str, actor: str, event_type: str, *,
         summary=summary,
         content=content,
         metadata_json=metadata_json,
+        artifact_type=artifact_type,
+        artifact_mime=artifact_mime,
+        artifact_size=artifact_size,
     )
     db.add(event)
     db.flush()
@@ -809,7 +934,7 @@ def _record_event(db, task_id: str, actor: str, event_type: str, *,
 def _release_all_locks():
     """Release all coordinator-held locks on shutdown."""
     try:
-        db = SessionLocal()
+        db = _new_session()
         try:
             # Fetch locked task IDs before releasing
             locked_ids = [
@@ -868,6 +993,13 @@ def _enrich_metadata(result) -> dict:
     return meta
 
 
+def _extract_result_artifacts(result) -> list[dict]:
+    """Pull A2A-style artifacts out of adapter metadata."""
+    if not result.metadata or not isinstance(result.metadata.get("artifacts"), list):
+        return []
+    return [a for a in result.metadata["artifacts"] if isinstance(a, dict)]
+
+
 def _activate_chain(db, completed_task):
     """When a task completes and has a chain_task_id, set the next task to
     queued so the coordinator picks it up on the next tick."""
@@ -916,7 +1048,7 @@ def execute_pending_actions(task_id: str) -> list[dict]:
 
     results: list[dict] = []
 
-    db = SessionLocal()
+    db = _new_session()
     try:
         task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
         if not task:
@@ -1013,7 +1145,7 @@ def _advance_overdue_scheduled_on_startup():
     poll because the in-memory guard resets.
     """
     try:
-        db = SessionLocal()
+        db = _new_session()
         try:
             now = _utcnow()
             overdue = db.query(AgentTask).filter(
