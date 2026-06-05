@@ -822,6 +822,7 @@ async function _showNewTaskForm() {
           <option value="user">User</option>
           <option value="hermes">Hermes</option>
           <option value="codex">Codex</option>
+          <option value="cursor">Cursor</option>
         </select>
         <select class="ah-input" id="ah-new-phase">
           <option value="">Phase (optional)</option>

@@ -78,12 +78,17 @@ class CursorAdapter(AbstractAdapter):
             cursor_sdk = importlib.import_module("cursor_sdk")
             Agent = cursor_sdk.Agent
             LocalAgentOptions = cursor_sdk.LocalAgentOptions
+            SandboxOptions = cursor_sdk.SandboxOptions
 
+            sandbox_enabled = sandbox_name != "read-only"
             result = await asyncio.to_thread(
                 Agent.prompt,
                 prompt,
                 model=self._model,
-                local=LocalAgentOptions(cwd=cwd, force=force),
+                local=LocalAgentOptions(
+                    cwd=cwd,
+                    sandbox_options=SandboxOptions(enabled=sandbox_enabled),
+                ),
             )
             return AgentAdapterResult(
                 summary=str(result)[:200],
