@@ -798,19 +798,6 @@ function _renderTaskDetail(task) {
     });
   }
 
-  // Export timeline as .md download
-  const exportBtn = document.getElementById('ah-export-btn');
-  if (exportBtn) {
-    exportBtn.addEventListener('click', () => {
-      const a = document.createElement('a');
-      a.href = `${API_BASE}/api/agent-hub/tasks/${task.id}/export`;
-      a.download = `task-${task.id.slice(0, 8)}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    });
-  }
-
   const addEventBtn = document.getElementById('ah-add-event-btn');
   if (addEventBtn) {
     addEventBtn.addEventListener('click', async () => {
