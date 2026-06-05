@@ -60,10 +60,8 @@ class CursorAdapter(AbstractAdapter):
         if sandbox_name not in CURSOR_SANDBOX_MODES:
             return _blocked(
                 f"Invalid sandbox_mode: {sandbox_name}",
-                (
-                    f"Task sandbox_mode '{sandbox_name}' is not one of "
-                    f"{sorted(CURSOR_SANDBOX_MODES)}."
-                ),
+                f"Task sandbox_mode '{sandbox_name}' is not one of "
+                f"{sorted(CURSOR_SANDBOX_MODES)}.",
             )
 
         prompt = (
@@ -72,14 +70,15 @@ class CursorAdapter(AbstractAdapter):
             or ""
         )
         cwd = workspace or os.getcwd()
-        force = sandbox_name == "danger-full-access"
 
         try:
-            # Windows: cursor-sdk calls os.get_blocking() which doesn't exist
-            # on Windows. Monkey-patch it before importing the SDK.
-            import os as _os
-            if not hasattr(_os, 'get_blocking'):
+            # Windows: cursor-sdk uses Unix-only os functions.
+            # Patch before importing so the SDK's internals see them.
+            _os = os
+            if not hasattr(_os, "get_blocking"):
                 _os.get_blocking = lambda fd: True
+            if not hasattr(_os, "set_blocking"):
+                _os.set_blocking = lambda fd, blocking: None
 
             cursor_sdk = importlib.import_module("cursor_sdk")
             Agent = cursor_sdk.Agent
@@ -95,7 +94,9 @@ class CursorAdapter(AbstractAdapter):
                     model=self._model,
                     local=LocalAgentOptions(
                         cwd=cwd,
-                        sandbox_options=SandboxOptions(enabled=sandbox_enabled),
+                        sandbox_options=SandboxOptions(
+                            enabled=sandbox_enabled
+                        ),
                     ),
                 ),
             )
@@ -112,11 +113,17 @@ class CursorAdapter(AbstractAdapter):
 
 
 def _has_cursor_auth() -> bool:
-    return bool(os.environ.get("CURSOR_API_KEY")) or (Path.home() / ".cursor" / "auth.json").exists()
+    return bool(os.environ.get("CURSOR_API_KEY")) or (
+        Path.home() / ".cursor" / "auth.json"
+    ).exists()
 
 
 def _sandbox_name(task, explicit: str | None) -> str:
-    value = explicit if explicit is not None else getattr(task, "sandbox_mode", None)
+    value = (
+        explicit
+        if explicit is not None
+        else getattr(task, "sandbox_mode", None)
+    )
     return value if isinstance(value, str) and value else "workspace-write"
 
 
