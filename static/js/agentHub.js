@@ -187,6 +187,13 @@ function _getModal() {
   modal.querySelector('#ah-batch-retry').addEventListener('click', () => _executeBatchAction('retry'));
   modal.querySelector('#ah-batch-delete').addEventListener('click', () => _executeBatchAction('delete'));
 
+  // Keyboard shortcuts (only when Agent Hub is open)
+  modal.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+    if (e.key === 'n' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); _showNewTaskForm(); return; }
+    if (e.key === '/' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); const s = document.getElementById('ah-search-input'); if (s) s.focus(); return; }
+  });
+
   // Debounced keyword search
   const searchInput = modal.querySelector('#ah-search-input');
   let _searchTimer = null;
@@ -705,6 +712,14 @@ function _renderTaskDetail(task) {
       <div class="ah-empty">Loading...</div>
     </div>
   `;
+
+  // Export button
+  const exportBtn = container.querySelector('#ah-export-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      window.open(`${API_BASE}/api/agent-hub/tasks/${task.id}/export`, '_blank');
+    });
+  }
 
   // Click-to-copy task ID
   const idEl = container.querySelector('.ah-detail-id');
