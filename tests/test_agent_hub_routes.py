@@ -58,6 +58,15 @@ def client():
     _db.engine = engine
     _db.SessionLocal = TestSession
 
+    # Also patch the route module's cached SessionLocal — it imports at module
+    # load time and won't pick up the _db.SessionLocal change on its own.
+    # When another test file (e.g. test_scheduled_tasks) runs first and patches
+    # routes.agent_hub_routes.SessionLocal, this module-level import is already
+    # cached and needs an explicit override.
+    import routes.agent_hub_routes as _ahr
+    _original_ahr_session = _ahr.SessionLocal
+    _ahr.SessionLocal = TestSession
+
     # Build a minimal FastAPI app
     from fastapi import FastAPI
     app = FastAPI()
@@ -71,6 +80,7 @@ def client():
     # Restore originals
     _db.engine = _original_engine
     _db.SessionLocal = _original_session
+    _ahr.SessionLocal = _original_ahr_session
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
