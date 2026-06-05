@@ -75,6 +75,12 @@ class CursorAdapter(AbstractAdapter):
         force = sandbox_name == "danger-full-access"
 
         try:
+            # Windows: cursor-sdk calls os.get_blocking() which doesn't exist
+            # on Windows. Monkey-patch it before importing the SDK.
+            import os as _os
+            if not hasattr(_os, 'get_blocking'):
+                _os.get_blocking = lambda fd: True
+
             cursor_sdk = importlib.import_module("cursor_sdk")
             Agent = cursor_sdk.Agent
             AgentOptions = cursor_sdk.AgentOptions
