@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from core.database import SessionLocal, AgentTask, AgentEvent
+from core.database import SessionLocal, AgentTask, AgentEvent, WorkflowTemplate
 from sqlalchemy import or_
 from src.auth_helpers import get_current_user
 
@@ -65,6 +65,7 @@ class TaskCreate(BaseModel):
     sandbox_mode: str = "workspace-write"
     depends_on: Optional[list] = None
     # List of task IDs that must be done before this one runs
+    tags: list[str] = []
 
 
 class TaskUpdate(BaseModel):
@@ -79,6 +80,7 @@ class TaskUpdate(BaseModel):
     chain_task_id: Optional[str] = None
     sandbox_mode: Optional[str] = None
     depends_on: Optional[list] = None
+    tags: Optional[list[str]] = None
 
 
 class EventCreate(BaseModel):
@@ -96,6 +98,26 @@ class AssignRequest(BaseModel):
 class TransitionRequest(BaseModel):
     status: str
     force_cancel: bool = False  # release lock when cancelling a running task
+
+
+class TemplateStep(BaseModel):
+    role: str
+    title_template: str
+    depends_on_index: Optional[int] = None
+
+
+class TemplateCreate(BaseModel):
+    name: str
+    steps: list[TemplateStep]
+
+
+class TemplateUpdate(BaseModel):
+    name: Optional[str] = None
+    steps: Optional[list[TemplateStep]] = None
+
+
+class TemplateInstantiate(BaseModel):
+    title: str
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -130,6 +152,7 @@ def _task_to_dict(t: AgentTask) -> dict:
         "sandbox_mode": t.sandbox_mode,
         "depends_on": t.depends_on,
         "created_by_task_id": t.created_by_task_id,
+        "tags": t.tags or [],
         "started_at": started,
         "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
         "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
@@ -148,6 +171,46 @@ def _event_to_dict(e: AgentEvent) -> dict:
         "metadata_json": e.metadata_json,
         "created_at": e.created_at.isoformat() + "Z" if e.created_at else None,
     }
+
+
+def _template_to_dict(t: WorkflowTemplate) -> dict:
+    return {
+        "id": t.id,
+        "owner": t.owner,
+        "name": t.name,
+        "steps": t.steps or [],
+        "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() + "Z" if t.updated_at else None,
+    }
+
+
+def _normalize_template_steps(steps: list[TemplateStep]) -> list[dict]:
+    if not steps:
+        raise HTTPException(400, "Template must include at least one step")
+    if len(steps) > 20:
+        raise HTTPException(400, "Too many template steps (max 20)")
+
+    normalized = []
+    for idx, step in enumerate(steps):
+        role = (step.role or "").strip()
+        title_template = (step.title_template or "").strip()
+        if role not in VALID_ROLES:
+            raise HTTPException(400, f"Invalid role at step {idx + 1}: {role}")
+        if not title_template:
+            raise HTTPException(400, f"title_template is required at step {idx + 1}")
+        depends_on_index = step.depends_on_index
+        if depends_on_index is not None:
+            if depends_on_index < 0 or depends_on_index >= idx:
+                raise HTTPException(
+                    400,
+                    f"depends_on_index at step {idx + 1} must reference an earlier step",
+                )
+        normalized.append({
+            "role": role,
+            "title_template": title_template,
+            "depends_on_index": depends_on_index,
+        })
+    return normalized
 
 
 def _validate_transition(current_status: str, new_status: str, locked_by: str | None,
@@ -220,6 +283,32 @@ def _detect_dependency_cycle(task_id: str, dep_ids: list, db) -> bool:
     return False
 
 
+def _index_task_for_rag(task: AgentTask) -> None:
+    """Best-effort semantic index update for Agent Hub tasks."""
+    try:
+        from src.agent_hub_rag import index_task
+
+        index_task(
+            task.id,
+            task.title or "",
+            task.objective or "",
+            task.status or "",
+            task.role or "",
+        )
+    except Exception as exc:
+        logger.debug("Agent Hub RAG index hook skipped for %s: %s", task.id, exc)
+
+
+def _delete_task_from_rag(task_id: str) -> None:
+    """Best-effort semantic index deletion for Agent Hub tasks."""
+    try:
+        from src.agent_hub_rag import delete_task_embedding
+
+        delete_task_embedding(task_id)
+    except Exception as exc:
+        logger.debug("Agent Hub RAG delete hook skipped for %s: %s", task_id, exc)
+
+
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def setup_agent_hub_routes() -> APIRouter:
@@ -250,6 +339,166 @@ def setup_agent_hub_routes() -> APIRouter:
             },
         )
 
+    # ── Workflow Templates ────────────────────────────────────────────────
+
+    @router.get("/templates")
+    async def list_templates(request: Request):
+        """List saved workflow templates for the current user."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            qobj = db.query(WorkflowTemplate)
+            if user:
+                qobj = qobj.filter(WorkflowTemplate.owner == user)
+            else:
+                qobj = qobj.filter(WorkflowTemplate.owner == None)  # noqa: E711
+            templates = qobj.order_by(WorkflowTemplate.updated_at.desc()).all()
+            return {"templates": [_template_to_dict(t) for t in templates]}
+        finally:
+            db.close()
+
+    @router.post("/templates", status_code=201)
+    async def create_template(request: Request, body: TemplateCreate):
+        """Create a saved workflow template."""
+        user = get_current_user(request)
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(400, "Template name is required")
+        steps = _normalize_template_steps(body.steps)
+
+        db = SessionLocal()
+        try:
+            template = WorkflowTemplate(
+                id=str(uuid.uuid4()),
+                owner=user,
+                name=name,
+                steps=steps,
+            )
+            db.add(template)
+            db.commit()
+            db.refresh(template)
+            return _template_to_dict(template)
+        finally:
+            db.close()
+
+    @router.get("/templates/{template_id}")
+    async def get_template(request: Request, template_id: str):
+        """Get one saved workflow template."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            template = db.query(WorkflowTemplate).filter(WorkflowTemplate.id == template_id).first()
+            if not template:
+                raise HTTPException(404, "Template not found")
+            if user and template.owner != user:
+                raise HTTPException(404, "Template not found")
+            if not user and template.owner is not None:
+                raise HTTPException(404, "Template not found")
+            return _template_to_dict(template)
+        finally:
+            db.close()
+
+    @router.put("/templates/{template_id}")
+    async def update_template(request: Request, template_id: str, body: TemplateUpdate):
+        """Update a saved workflow template."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            template = db.query(WorkflowTemplate).filter(WorkflowTemplate.id == template_id).first()
+            if not template:
+                raise HTTPException(404, "Template not found")
+            if user and template.owner != user:
+                raise HTTPException(404, "Template not found")
+            if not user and template.owner is not None:
+                raise HTTPException(404, "Template not found")
+
+            if body.name is not None:
+                name = body.name.strip()
+                if not name:
+                    raise HTTPException(400, "Template name is required")
+                template.name = name
+            if body.steps is not None:
+                template.steps = _normalize_template_steps(body.steps)
+
+            db.commit()
+            db.refresh(template)
+            return _template_to_dict(template)
+        finally:
+            db.close()
+
+    @router.delete("/templates/{template_id}")
+    async def delete_template(request: Request, template_id: str):
+        """Delete a saved workflow template."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            template = db.query(WorkflowTemplate).filter(WorkflowTemplate.id == template_id).first()
+            if not template:
+                raise HTTPException(404, "Template not found")
+            if user and template.owner != user:
+                raise HTTPException(404, "Template not found")
+            if not user and template.owner is not None:
+                raise HTTPException(404, "Template not found")
+            db.delete(template)
+            db.commit()
+            return {"ok": True}
+        finally:
+            db.close()
+
+    @router.post("/templates/{template_id}/instantiate")
+    async def instantiate_template(request: Request, template_id: str, body: TemplateInstantiate):
+        """Create an Agent Hub task chain from a saved workflow template."""
+        user = get_current_user(request)
+        input_title = (body.title or "").strip() or "Untitled Task"
+        db = SessionLocal()
+        created_tasks: list[AgentTask] = []
+        try:
+            template = db.query(WorkflowTemplate).filter(WorkflowTemplate.id == template_id).first()
+            if not template:
+                raise HTTPException(404, "Template not found")
+            if user and template.owner != user:
+                raise HTTPException(404, "Template not found")
+            if not user and template.owner is not None:
+                raise HTTPException(404, "Template not found")
+
+            steps = _normalize_template_steps([
+                TemplateStep(**step) for step in (template.steps or [])
+            ])
+            task_ids: list[str] = []
+            for step in steps:
+                depends_on = None
+                depends_on_index = step.get("depends_on_index")
+                if depends_on_index is not None:
+                    depends_on = [task_ids[depends_on_index]]
+                task = AgentTask(
+                    id=str(uuid.uuid4()),
+                    owner=user,
+                    title=step["title_template"].replace("{title}", input_title),
+                    status="draft",
+                    role=step["role"],
+                    depends_on=depends_on,
+                    tags=[],
+                )
+                db.add(task)
+                db.flush()
+                created_tasks.append(task)
+                task_ids.append(task.id)
+
+            if created_tasks:
+                created_tasks[0].status = "queued"
+
+            db.commit()
+            for task in created_tasks:
+                db.refresh(task)
+
+            from src.agent_hub_events import publish
+            for task in created_tasks:
+                publish(user or "", "task_created", _task_to_dict(task))
+
+            return {"ok": True, "task_ids": task_ids}
+        finally:
+            db.close()
+
     # ── Task CRUD ─────────────────────────────────────────────────────────
 
     @router.get("/tasks")
@@ -258,8 +507,9 @@ def setup_agent_hub_routes() -> APIRouter:
         status: Optional[str] = Query(None),
         owner_agent: Optional[str] = Query(None, alias="owner"),
         q: Optional[str] = Query(None, description="Free-text search on title and objective"),
+        tag: Optional[str] = Query(None),
     ):
-        """List Agent Hub tasks, optionally filtered by status, owner, and/or keyword search."""
+        """List Agent Hub tasks, optionally filtered by status, owner, tag, and/or keyword search."""
         user = get_current_user(request)
         db = SessionLocal()
         try:
@@ -272,6 +522,8 @@ def setup_agent_hub_routes() -> APIRouter:
                 qobj = qobj.filter(AgentTask.status == status)
             if owner_agent:
                 qobj = qobj.filter(AgentTask.current_owner == owner_agent)
+            if tag:
+                qobj = qobj.filter(AgentTask.tags.contains([tag]))
             if q:
                 pattern = f"%{q}%"
                 qobj = qobj.filter(or_(
@@ -296,35 +548,37 @@ def setup_agent_hub_routes() -> APIRouter:
         if body.role is not None and body.role not in VALID_ROLES:
             raise HTTPException(400, f"Invalid role: {body.role}")
 
-        # Validate dependencies
-        dep_ids = None
-        if body.depends_on is not None:
-            dep_ids = _validate_dependencies(body.depends_on, db)
-            # Cycle check: new task doesn't have an ID yet, but we check that
-            # none of the deps transitively depend on each other in a cycle
-            # (full cycle detection happens on update when task has an ID)
-
-        task = AgentTask(
-            id=str(uuid.uuid4()),
-            owner=user,
-            title=body.title,
-            objective=body.objective,
-            status=body.status,
-            phase=body.phase,
-            current_owner=body.current_owner,
-            role=body.role,
-            depends_on=dep_ids,
-            approval_required=body.approval_required,
-            session_id=body.session_id,
-            chain_task_id=body.chain_task_id,
-            sandbox_mode=body.sandbox_mode,
-        )
         db = SessionLocal()
         try:
+            # Validate dependencies
+            dep_ids = None
+            if body.depends_on is not None:
+                dep_ids = _validate_dependencies(body.depends_on, db)
+                # Cycle check: new task doesn't have an ID yet, but we check that
+                # none of the deps transitively depend on each other in a cycle
+                # (full cycle detection happens on update when task has an ID)
+
+            task = AgentTask(
+                id=str(uuid.uuid4()),
+                owner=user,
+                title=body.title,
+                objective=body.objective,
+                status=body.status,
+                phase=body.phase,
+                current_owner=body.current_owner,
+                role=body.role,
+                depends_on=dep_ids,
+                approval_required=body.approval_required,
+                session_id=body.session_id,
+                chain_task_id=body.chain_task_id,
+                sandbox_mode=body.sandbox_mode,
+                tags=body.tags,
+            )
             db.add(task)
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
+            _index_task_for_rag(task)
             # Publish after commit succeeds
             from src.agent_hub_events import publish
             publish(user or "", "task_created", result)
@@ -398,10 +652,13 @@ def setup_agent_hub_routes() -> APIRouter:
                 if _detect_dependency_cycle(task_id, dep_ids, db):
                     raise HTTPException(400, "Dependency cycle detected")
                 task.depends_on = dep_ids if dep_ids else None
+            if body.tags is not None:
+                task.tags = body.tags
 
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
+            _index_task_for_rag(task)
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result
@@ -421,11 +678,43 @@ def setup_agent_hub_routes() -> APIRouter:
                 raise HTTPException(404, "Task not found")
             db.delete(task)
             db.commit()
+            _delete_task_from_rag(task_id)
             from src.agent_hub_events import publish
             publish(user or "", "task_deleted", {"id": task_id})
             return {"ok": True}
         finally:
             db.close()
+
+    @router.get("/tasks/{task_id}/similar")
+    async def similar_tasks(request: Request, task_id: str, n: int = Query(5, ge=1, le=20)):
+        """Return semantically similar Agent Hub tasks."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
+            if not task:
+                raise HTTPException(404, "Task not found")
+            if user and task.owner and task.owner != user:
+                raise HTTPException(404, "Task not found")
+        finally:
+            db.close()
+
+        from src.agent_hub_rag import find_similar
+
+        similar = find_similar(task_id, n)
+        if similar:
+            ids = [item["id"] for item in similar if item.get("id")]
+            db = SessionLocal()
+            try:
+                qobj = db.query(AgentTask).filter(AgentTask.id.in_(ids))
+                if user:
+                    qobj = qobj.filter(AgentTask.owner == user)
+                allowed_ids = {row.id for row in qobj.all()}
+            finally:
+                db.close()
+            similar = [item for item in similar if item.get("id") in allowed_ids]
+
+        return {"task_id": task_id, "similar": similar}
 
     # ── Events ────────────────────────────────────────────────────────────
 
@@ -490,6 +779,7 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
+            _index_task_for_rag(task)
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result
@@ -684,6 +974,7 @@ def setup_agent_hub_routes() -> APIRouter:
             db.commit()
             db.refresh(task)
             result = _task_to_dict(task)
+            _index_task_for_rag(task)
             from src.agent_hub_events import publish
             publish(user or "", "task_updated", result)
             return result

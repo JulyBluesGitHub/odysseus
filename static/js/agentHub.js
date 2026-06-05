@@ -31,6 +31,7 @@ let _eventSource = null;             // SSE connection
 let _fallbackPoll = null;            // polling fallback when SSE errors
 let _listTimerInterval = null;       // 1s tick for all visible row timers
 let _detailTimerSince = null;        // ISO timestamp for selected task's running timer
+let _newTags = [];
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,7 @@ function _getModal() {
         <div class="ah-header-status" id="ah-coordinator-status"></div>
         <div class="modal-header-actions">
           <button class="ah-bindings-btn" id="ah-bindings-btn" title="Role Bindings">⚙</button>
+          <button class="ah-manage-templates-btn" id="ah-templates-manage-btn" title="Manage Templates">Templates</button>
           <button class="ah-refresh-btn" title="Refresh">⟳</button>
           <button class="modal-minimize-btn">_</button>
           <button class="modal-close-btn close-btn">✕</button>
@@ -95,6 +97,7 @@ function _getModal() {
           <div class="ah-list-toolbar">
             <input type="text" class="ah-filter ah-search-input" id="ah-search-input" placeholder="Search tasks…">
             <button class="ah-btn ah-btn-primary" id="ah-new-task-btn">+ New Task</button>
+            <input type="text" class="ah-filter ah-tag-input" id="ah-tag-filter" placeholder="Filter by tag...">
             <select class="ah-filter" id="ah-status-filter">
               <option value="">All Statuses</option>
               <option value="draft">Draft</option>
@@ -155,9 +158,11 @@ function _getModal() {
   });
   modal.querySelector('.ah-refresh-btn').addEventListener('click', () => _fetchAndRender());
   modal.querySelector('#ah-bindings-btn')?.addEventListener('click', () => _showBindings());
+  modal.querySelector('#ah-templates-manage-btn')?.addEventListener('click', () => _showTemplates());
   modal.querySelector('#ah-new-task-btn').addEventListener('click', () => _showNewTaskForm());
   modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
+  modal.querySelector('#ah-tag-filter').addEventListener('change', () => _renderFromCache());
 
   // Batch action bar buttons
   modal.querySelector('#ah-batch-cancel').addEventListener('click', () => _executeBatchAction('cancel'));
@@ -300,13 +305,16 @@ async function _fetchTasks() {
   const statusEl = document.getElementById('ah-status-filter');
   const ownerEl = document.getElementById('ah-owner-filter');
   const searchEl = document.getElementById('ah-search-input');
+  const tagEl = document.getElementById('ah-tag-filter');
   const params = new URLSearchParams();
   const status = statusEl?.value;
   const owner = ownerEl?.value;
   const search = searchEl?.value.trim();
+  const tag = tagEl?.value.trim();
   if (status) params.set('status', status);
   if (owner) params.set('owner', owner);
   if (search) params.set('q', search);
+  if (tag) params.set('tag', tag);
   const url = `${API_BASE}/api/agent-hub/tasks${params.toString() ? '?' + params : ''}`;
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
@@ -365,9 +373,11 @@ function _getFilteredTasks() {
   const statusEl = document.getElementById('ah-status-filter');
   const ownerEl = document.getElementById('ah-owner-filter');
   const searchEl = document.getElementById('ah-search-input');
+  const tagEl = document.getElementById('ah-tag-filter');
   const status = statusEl?.value || '';
   const owner = ownerEl?.value || '';
   const search = (searchEl?.value || '').trim().toLowerCase();
+  const tag = (tagEl?.value || '').trim().toLowerCase();
 
   let tasks = Array.from(_taskMap.values());
 
@@ -382,6 +392,9 @@ function _getFilteredTasks() {
       (t.title || '').toLowerCase().includes(search) ||
       (t.objective || '').toLowerCase().includes(search)
     );
+  }
+  if (tag) {
+    tasks = tasks.filter(t => (t.tags || []).some(item => (item || '').toLowerCase() === tag));
   }
 
   // Sort by updated_at descending
@@ -424,12 +437,14 @@ function _renderTaskList(tasks) {
     const doneAttr = terminalStatuses.includes(t.status) && t.started_at && t.updated_at
       ? `data-done-at="${t.updated_at}"` : '';
     const checked = _selected.has(t.id) ? 'checked' : '';
+    const tagsHtml = (t.tags || []).map(tag => `<span class="ah-task-tag">${_esc(tag)}</span>`).join('');
     return `
       <div class="ah-task-item ${activeClass}" data-task-id="${t.id}" data-status="${t.status}" ${runningAttr} ${doneAttr}>
         <div class="ah-task-item-header">
           <input type="checkbox" class="ah-task-checkbox" data-id="${t.id}" ${checked}>
           ${statusDot}
           <span class="ah-task-title">${_esc(t.title)}</span>
+          ${tagsHtml}
           <button class="ah-task-delete-btn" data-delete-id="${t.id}" title="Delete task">×</button>
         </div>
         <div class="ah-task-item-meta">
@@ -551,6 +566,12 @@ function _renderTaskDetail(task) {
         <span class="ah-detail-timer" id="ah-running-timer" style="display:none"></span>
       </div>
       <div class="ah-detail-objective">${_esc(task.objective || 'No objective set.')}</div>
+      <div class="ah-detail-tags">
+        <div class="ah-tag-chips">
+          ${(task.tags || []).map((tag, idx) => `<span class="ah-tag-chip">${_esc(tag)} <button class="ah-tag-remove" data-tag-index="${idx}">x</button></span>`).join('')}
+        </div>
+        <input class="ah-filter ah-tag-input" id="ah-detail-tag-input" placeholder="Add tag...">
+      </div>
     </div>
     ${approvalCallout}
     <div class="ah-detail-actions">
@@ -580,6 +601,10 @@ function _renderTaskDetail(task) {
       <h4 class="ah-timeline-title">Timeline</h4>
       ${timeline || '<div class="ah-empty">No events yet.</div>'}
     </div>
+    <div class="ah-similar-tasks" id="ah-similar-tasks">
+      <div class="ah-similar-title">Similar Tasks</div>
+      <div class="ah-empty">Loading...</div>
+    </div>
   `;
 
   // Click-to-copy task ID
@@ -594,6 +619,29 @@ function _renderTaskDetail(task) {
   }
 
   // Bind detail actions
+  container.querySelectorAll('.ah-tag-remove').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const removeIndex = Number(btn.dataset.tagIndex);
+      const tags = (task.tags || []).filter((_, idx) => idx !== removeIndex);
+      await _apiCall('PUT', `/api/agent-hub/tasks/${task.id}`, { tags });
+      _selectTask(task.id);
+    });
+  });
+
+  const detailTagInput = document.getElementById('ah-detail-tag-input');
+  if (detailTagInput) {
+    detailTagInput.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const tag = detailTagInput.value.trim();
+      if (!tag || (task.tags || []).includes(tag)) return;
+      await _apiCall('PUT', `/api/agent-hub/tasks/${task.id}`, { tags: [...(task.tags || []), tag] });
+      detailTagInput.value = '';
+      _selectTask(task.id);
+    });
+  }
+
   const assignSelect = document.getElementById('ah-assign-select');
   if (assignSelect) {
     assignSelect.addEventListener('change', async () => {
@@ -681,6 +729,41 @@ function _renderTaskDetail(task) {
   } else if (parentLabel) {
     parentLabel.textContent = '(none)';
   }
+
+  _renderSimilarTasks(task.id);
+}
+
+async function _renderSimilarTasks(taskId) {
+  const panel = document.getElementById('ah-similar-tasks');
+  if (!panel) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/agent-hub/tasks/${encodeURIComponent(taskId)}/similar?n=5`);
+    if (!res.ok) throw new Error(`similar ${res.status}`);
+    const data = await res.json();
+    if (_selectedTaskId !== taskId) return;
+    const similar = data.similar || [];
+    if (!similar.length) {
+      panel.innerHTML = '<div class="ah-similar-title">Similar Tasks</div><div class="ah-empty">No similar tasks found.</div>';
+      return;
+    }
+    panel.innerHTML = `
+      <div class="ah-similar-title">Similar Tasks</div>
+      ${similar.map(item => `
+        <div class="ah-similar-item" data-task-id="${_esc(item.id)}">
+          <span>${_esc(item.title || item.id)}</span>
+          <span class="ah-task-tag">${_esc(item.status || 'unknown')}</span>
+          ${item.distance === null || item.distance === undefined ? '' : `<span class="ah-similar-distance">${Number(item.distance).toFixed(3)}</span>`}
+        </div>
+      `).join('')}
+    `;
+    panel.querySelectorAll('.ah-similar-item').forEach(el => {
+      el.addEventListener('click', () => _selectTask(el.dataset.taskId));
+    });
+  } catch (_) {
+    if (_selectedTaskId === taskId) {
+      panel.innerHTML = '<div class="ah-similar-title">Similar Tasks</div><div class="ah-empty">Unavailable.</div>';
+    }
+  }
 }
 
 function _renderEmptyDetail() {
@@ -707,11 +790,12 @@ function _renderCoordinatorStatusFromData(status) {
 
 // ── New task inline form ──────────────────────────────────────────────────────
 
-function _showNewTaskForm() {
+async function _showNewTaskForm() {
   const container = document.getElementById('ah-task-detail');
   if (!container) return;
   _selectedTaskId = null;
   _detailTimerSince = null;
+  const workflowTemplates = await _fetchTemplates();
   container.innerHTML = `
     <div class="ah-new-task-form">
       <h3>New Task</h3>
@@ -721,8 +805,17 @@ function _showNewTaskForm() {
         <button class="ah-template-btn" data-template="review">Code Review</button>
         <button class="ah-template-btn ah-template-btn--clear" data-template="blank">Clear</button>
       </div>
+      <div class="ah-template-picker-row">
+        <select class="ah-input" id="ah-template-picker">
+          <option value="">No template</option>
+          ${workflowTemplates.map(t => `<option value="${_esc(t.id)}">${_esc(t.name)}</option>`).join('')}
+        </select>
+        <button class="ah-btn" id="ah-template-instantiate">Use Template</button>
+      </div>
       <input class="ah-input" id="ah-new-title" placeholder="Title" value="">
       <textarea class="ah-input ah-input-textarea" id="ah-new-objective" placeholder="Describe what you would like to do" rows="4"></textarea>
+      <input class="ah-input ah-tag-input" id="ah-tag-input" placeholder="Add tag...">
+      <div class="ah-tag-chips" id="ah-tag-chips"></div>
       <div class="ah-new-task-row">
         <select class="ah-input" id="ah-new-owner">
           <option value="">Assign to…</option>
@@ -764,9 +857,29 @@ function _showNewTaskForm() {
       </div>
     </div>
   `;
+  _newTags = [];
+  _renderNewTagChips();
 
   container.querySelectorAll('.ah-template-btn').forEach(btn => {
     btn.addEventListener('click', () => _applyTemplate(btn.dataset.template));
+  });
+
+  document.getElementById('ah-template-instantiate').addEventListener('click', async () => {
+    const templateId = document.getElementById('ah-template-picker').value;
+    if (!templateId) return;
+    const title = document.getElementById('ah-new-title').value.trim() || 'Untitled Task';
+    const result = await _apiCall('POST', `/api/agent-hub/templates/${templateId}/instantiate`, { title });
+    if (!result) return;
+    _showToast(`Created ${result.task_ids.length} tasks from template`);
+    await _fetchAndRender();
+    if (result.task_ids.length) _selectTask(result.task_ids[0]);
+  });
+
+  document.getElementById('ah-tag-input').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    _addNewTag(e.target.value);
+    e.target.value = '';
   });
 
   const sandboxSelect = document.getElementById('ah-new-sandbox');
@@ -785,7 +898,7 @@ function _showNewTaskForm() {
     const chainId = document.getElementById('ah-new-chain').value.trim();
     const sandbox = document.getElementById('ah-new-sandbox').value;
     const role = document.getElementById('ah-new-role')?.value || undefined;
-    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, sandbox_mode: sandbox };
+    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, sandbox_mode: sandbox, tags: _newTags };
     // Auto-queue if assigned to a non-user agent OR a role is set
     if ((owner && owner !== 'user') || role) body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);
@@ -797,6 +910,28 @@ function _showNewTaskForm() {
     }
   });
   document.getElementById('ah-cancel-new-btn').addEventListener('click', () => { _selectedTaskId = null; _renderEmptyDetail(); });
+}
+
+function _addNewTag(value) {
+  const tag = (value || '').trim();
+  if (!tag || _newTags.includes(tag)) return;
+  _newTags.push(tag);
+  _renderNewTagChips();
+}
+
+function _renderNewTagChips() {
+  const chips = document.getElementById('ah-tag-chips');
+  if (!chips) return;
+  chips.innerHTML = _newTags.map((tag, idx) =>
+    `<span class="ah-tag-chip">${_esc(tag)} <button class="ah-tag-remove" data-tag-index="${idx}">x</button></span>`
+  ).join('');
+  chips.querySelectorAll('.ah-tag-remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const removeIndex = Number(btn.dataset.tagIndex);
+      _newTags = _newTags.filter((_, idx) => idx !== removeIndex);
+      _renderNewTagChips();
+    });
+  });
 }
 
 // ── Templates ─────────────────────────────────────────────────────────────────
@@ -836,6 +971,163 @@ function _applyTemplate(name) {
   document.querySelectorAll('.ah-template-btn').forEach(b => {
     b.classList.toggle('ah-template-btn--active', b.dataset.template === name);
   });
+}
+
+async function _fetchTemplates() {
+  try {
+    const res = await fetch(`${API_BASE}/api/agent-hub/templates`, { credentials: 'same-origin' });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.templates || [];
+  } catch (_) { return []; }
+}
+
+async function _showTemplates(editTemplateId = null, draft = null) {
+  const container = document.getElementById('ah-task-detail');
+  if (!container) return;
+  _selectedTaskId = null;
+  _detailTimerSince = null;
+
+  const templates = await _fetchTemplates();
+  const editing = editTemplateId
+    ? (draft || templates.find(t => t.id === editTemplateId))
+    : draft;
+  const showForm = Boolean(editing);
+
+  container.innerHTML = `
+    <div class="ah-new-task-form">
+      <div class="ah-panel-heading">
+        <h3>Workflow Templates</h3>
+        <button class="ah-btn ah-btn-small" id="ah-new-template-btn">New Template</button>
+      </div>
+      <div class="ah-template-list">
+        ${templates.length ? templates.map(t => _renderTemplateCard(t)).join('') : '<div class="ah-empty">No templates yet</div>'}
+      </div>
+      ${showForm ? _renderTemplateForm(editTemplateId, editing) : ''}
+    </div>
+  `;
+
+  container.querySelector('#ah-new-template-btn')?.addEventListener('click', () => {
+    _showTemplates(null, { name: '', steps: [{ role: 'diagnoser', title_template: 'Diagnose: {title}', depends_on_index: null }] });
+  });
+
+  container.querySelectorAll('.ah-template-edit').forEach(btn => {
+    btn.addEventListener('click', () => _showTemplates(btn.dataset.templateId));
+  });
+  container.querySelectorAll('.ah-template-delete').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await _apiCall('DELETE', `/api/agent-hub/templates/${btn.dataset.templateId}`);
+      _showToast('Template deleted');
+      _showTemplates();
+    });
+  });
+
+  if (!showForm) return;
+
+  container.querySelector('#ah-template-save')?.addEventListener('click', async () => {
+    const payload = _readTemplateForm();
+    if (!payload.name || payload.steps.length === 0) return;
+    const result = editTemplateId
+      ? await _apiCall('PUT', `/api/agent-hub/templates/${editTemplateId}`, payload)
+      : await _apiCall('POST', '/api/agent-hub/templates', payload);
+    if (!result) return;
+    _showToast(editTemplateId ? 'Template updated' : 'Template created');
+    _showTemplates();
+  });
+  container.querySelector('#ah-template-cancel')?.addEventListener('click', () => _showTemplates());
+  container.querySelector('#ah-template-add-step')?.addEventListener('click', () => {
+    const current = _readTemplateForm();
+    current.steps.push({
+      role: 'implementer',
+      title_template: 'Implement: {title}',
+      depends_on_index: current.steps.length ? current.steps.length - 1 : null,
+    });
+    _showTemplates(editTemplateId, current);
+  });
+  container.querySelectorAll('.ah-template-remove-step').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const removeIndex = Number(btn.dataset.stepIndex);
+      const current = _readTemplateForm();
+      current.steps = current.steps
+        .filter((_, idx) => idx !== removeIndex)
+        .map((step, idx) => ({
+          ...step,
+          depends_on_index: step.depends_on_index != null && step.depends_on_index < idx
+            ? step.depends_on_index
+            : null,
+        }));
+      _showTemplates(editTemplateId, current);
+    });
+  });
+}
+
+function _renderTemplateCard(template) {
+  const steps = (template.steps || []).map(s => `<span class="ah-template-step">${_esc(s.role)}</span>`).join('');
+  return `
+    <div class="ah-template-card">
+      <div class="ah-template-card-head">
+        <div>
+          <div class="ah-template-name">${_esc(template.name)}</div>
+          <div class="ah-template-steps">${steps || 'No steps'}</div>
+        </div>
+        <div class="ah-template-card-actions">
+          <button class="ah-btn ah-btn-small ah-template-edit" data-template-id="${_esc(template.id)}">Edit</button>
+          <button class="ah-btn ah-btn-small ah-btn-danger ah-template-delete" data-template-id="${_esc(template.id)}">Delete</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function _renderTemplateForm(templateId, template) {
+  const steps = template.steps || [];
+  return `
+    <div class="ah-template-form">
+      <h3>${templateId ? 'Edit Template' : 'New Template'}</h3>
+      <input class="ah-input" id="ah-template-name-input" placeholder="Template name" value="${_esc(template.name || '')}">
+      <div id="ah-template-steps-editor">
+        ${steps.map((step, idx) => _renderTemplateStepEditor(step, idx)).join('')}
+      </div>
+      <div class="ah-new-task-actions">
+        <button class="ah-btn" id="ah-template-add-step">Add Step</button>
+        <button class="ah-btn ah-btn-primary" id="ah-template-save">Save Template</button>
+        <button class="ah-btn" id="ah-template-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+function _renderTemplateStepEditor(step, idx) {
+  const dep = step.depends_on_index == null ? '' : String(step.depends_on_index);
+  const depOptions = ['<option value="">No dependency</option>'];
+  for (let i = 0; i < idx; i += 1) {
+    depOptions.push(`<option value="${i}" ${dep === String(i) ? 'selected' : ''}>Depends on step ${i + 1}</option>`);
+  }
+  return `
+    <div class="ah-step-editor" data-step-index="${idx}">
+      <select class="ah-step-role">
+        <option value="diagnoser" ${step.role === 'diagnoser' ? 'selected' : ''}>Diagnoser</option>
+        <option value="implementer" ${step.role === 'implementer' ? 'selected' : ''}>Implementer</option>
+        <option value="verifier" ${step.role === 'verifier' ? 'selected' : ''}>Verifier</option>
+      </select>
+      <input class="ah-step-title" placeholder="Title template" value="${_esc(step.title_template || '')}">
+      <select class="ah-step-depends">${depOptions.join('')}</select>
+      <button class="ah-btn ah-btn-small ah-btn-danger ah-template-remove-step" data-step-index="${idx}">Remove</button>
+    </div>
+  `;
+}
+
+function _readTemplateForm() {
+  const name = document.getElementById('ah-template-name-input')?.value.trim() || '';
+  const steps = Array.from(document.querySelectorAll('.ah-step-editor')).map(row => {
+    const depValue = row.querySelector('.ah-step-depends')?.value || '';
+    return {
+      role: row.querySelector('.ah-step-role')?.value || 'diagnoser',
+      title_template: row.querySelector('.ah-step-title')?.value.trim() || '',
+      depends_on_index: depValue === '' ? null : Number(depValue),
+    };
+  }).filter(step => step.title_template);
+  return { name, steps };
 }
 
 // ── Selection ─────────────────────────────────────────────────────────────────

@@ -518,6 +518,16 @@ def _build_role_context_brief(db, task) -> str | None:
             for ds in dep_statuses:
                 lines.append(f"- {ds}")
 
+    try:
+        from src.agent_hub_rag import rag_context_for_task
+
+        rag = rag_context_for_task(task.title or "", task.objective or "", n=3)
+        if rag:
+            lines.append("")
+            lines.append(rag)
+    except Exception as exc:
+        logger.debug("Agent Hub RAG context injection skipped for %s: %s", task.id, exc)
+
     brief = "\n".join(lines)[:_MAX_BRIEF_CHARS]
     _last_brief_fingerprints[task.id] = fp
     return brief

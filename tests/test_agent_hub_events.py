@@ -462,6 +462,122 @@ class TestRoleDispatch:
         assert any(t["role"] == "verifier" for t in tasks)
 
 
+class TestWorkflowTemplates:
+    """Tests for saved Agent Hub workflow templates."""
+
+    def _steps(self):
+        return [
+            {"role": "diagnoser", "title_template": "Diagnose: {title}", "depends_on_index": None},
+            {"role": "implementer", "title_template": "Fix: {title}", "depends_on_index": 0},
+            {"role": "verifier", "title_template": "Verify: {title}", "depends_on_index": 1},
+        ]
+
+    def test_create_template(self, client):
+        name = f"Bug Fix {uuid.uuid4().hex}"
+        r = client.post("/api/agent-hub/templates", json={
+            "name": name,
+            "steps": self._steps(),
+        })
+        assert r.status_code == 201
+        template_id = r.json()["id"]
+
+        r2 = client.get("/api/agent-hub/templates")
+        assert r2.status_code == 200
+        templates = [t for t in r2.json()["templates"] if t["id"] == template_id]
+        assert len(templates) == 1
+        assert templates[0]["name"] == name
+        assert templates[0]["steps"][1]["depends_on_index"] == 0
+
+    def test_list_templates_owner_scoped(self, client):
+        name = f"Scoped {uuid.uuid4().hex}"
+        with patch("routes.agent_hub_routes.get_current_user", return_value="user-a"):
+            r = client.post("/api/agent-hub/templates", json={
+                "name": name,
+                "steps": self._steps(),
+            })
+            assert r.status_code == 201
+
+        with patch("routes.agent_hub_routes.get_current_user", return_value="user-b"):
+            r2 = client.get("/api/agent-hub/templates")
+            assert r2.status_code == 200
+            assert all(t["name"] != name for t in r2.json()["templates"])
+
+    def test_instantiate_template(self, client):
+        r = client.post("/api/agent-hub/templates", json={
+            "name": f"Instantiate {uuid.uuid4().hex}",
+            "steps": self._steps(),
+        })
+        assert r.status_code == 201
+        template_id = r.json()["id"]
+
+        r2 = client.post(f"/api/agent-hub/templates/{template_id}/instantiate", json={
+            "title": "Checkout crash",
+        })
+        assert r2.status_code == 200
+        task_ids = r2.json()["task_ids"]
+        assert len(task_ids) == 3
+
+        db = _db.SessionLocal()
+        try:
+            tasks = [db.query(AgentTask).filter(AgentTask.id == tid).first() for tid in task_ids]
+            assert [t.role for t in tasks] == ["diagnoser", "implementer", "verifier"]
+            assert tasks[0].status == "queued"
+            assert tasks[1].status == "draft"
+            assert tasks[2].status == "draft"
+            assert tasks[0].depends_on is None
+            assert tasks[1].depends_on == [task_ids[0]]
+            assert tasks[2].depends_on == [task_ids[1]]
+        finally:
+            db.close()
+
+    def test_instantiate_substitutes_title(self, client):
+        r = client.post("/api/agent-hub/templates", json={
+            "name": f"Substitute {uuid.uuid4().hex}",
+            "steps": [
+                {"role": "diagnoser", "title_template": "Diagnose: {title}", "depends_on_index": None},
+            ],
+        })
+        assert r.status_code == 201
+
+        r2 = client.post(f"/api/agent-hub/templates/{r.json()['id']}/instantiate", json={
+            "title": "Login bug",
+        })
+        assert r2.status_code == 200
+        task_id = r2.json()["task_ids"][0]
+
+        r3 = client.get(f"/api/agent-hub/tasks/{task_id}")
+        assert r3.status_code == 200
+        assert r3.json()["title"] == "Diagnose: Login bug"
+
+    def test_delete_template(self, client):
+        r = client.post("/api/agent-hub/templates", json={
+            "name": f"Delete {uuid.uuid4().hex}",
+            "steps": self._steps(),
+        })
+        assert r.status_code == 201
+        template_id = r.json()["id"]
+
+        r2 = client.delete(f"/api/agent-hub/templates/{template_id}")
+        assert r2.status_code == 200
+        r3 = client.get(f"/api/agent-hub/templates/{template_id}")
+        assert r3.status_code == 404
+
+    def test_update_template(self, client):
+        r = client.post("/api/agent-hub/templates", json={
+            "name": f"Before {uuid.uuid4().hex}",
+            "steps": self._steps(),
+        })
+        assert r.status_code == 201
+        template_id = r.json()["id"]
+        new_name = f"After {uuid.uuid4().hex}"
+
+        r2 = client.put(f"/api/agent-hub/templates/{template_id}", json={
+            "name": new_name,
+        })
+        assert r2.status_code == 200
+        assert r2.json()["name"] == new_name
+
+
 class TestContextBriefs:
     """Tests for role-specific context briefs."""
 
@@ -720,3 +836,79 @@ class TestBatchOperations:
             "action": "invalid", "task_ids": ["some-id"],
         })
         assert r.status_code == 400
+
+
+class TestTags:
+    """Tests for Agent Hub task tags."""
+
+    def test_create_task_with_tags(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Tagged create",
+            "status": "draft",
+            "tags": ["bug", "ui"],
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.get(f"/api/agent-hub/tasks/{task_id}")
+        assert r2.status_code == 200
+        assert r2.json()["tags"] == ["bug", "ui"]
+
+    def test_update_task_tags(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Tagged update",
+            "status": "draft",
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.put(f"/api/agent-hub/tasks/{task_id}", json={
+            "tags": ["feature", "backend"],
+        })
+        assert r2.status_code == 200
+        assert r2.json()["tags"] == ["feature", "backend"]
+
+    def test_filter_by_tag(self, client):
+        bug_tag = f"bug-{uuid.uuid4().hex}"
+        feature_tag = f"feature-{uuid.uuid4().hex}"
+        r1 = client.post("/api/agent-hub/tasks", json={
+            "title": "Bug tagged task",
+            "status": "draft",
+            "tags": [bug_tag],
+        })
+        r2 = client.post("/api/agent-hub/tasks", json={
+            "title": "Feature tagged task",
+            "status": "draft",
+            "tags": [feature_tag],
+        })
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+
+        r3 = client.get(f"/api/agent-hub/tasks?tag={bug_tag}")
+        assert r3.status_code == 200
+        tasks = r3.json()["tasks"]
+        assert len(tasks) == 1
+        assert tasks[0]["id"] == r1.json()["id"]
+        assert tasks[0]["tags"] == [bug_tag]
+
+    def test_filter_by_tag_no_match(self, client):
+        tag = f"nonexistent-{uuid.uuid4().hex}"
+        r = client.get(f"/api/agent-hub/tasks?tag={tag}")
+        assert r.status_code == 200
+        assert r.json()["tasks"] == []
+
+    def test_tags_persist_in_list(self, client):
+        tag = f"persist-{uuid.uuid4().hex}"
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Tagged list",
+            "status": "draft",
+            "tags": [tag],
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.get("/api/agent-hub/tasks")
+        assert r2.status_code == 200
+        tasks = r2.json()["tasks"]
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["tags"] == [tag]

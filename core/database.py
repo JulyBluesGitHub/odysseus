@@ -1,9 +1,11 @@
 import os
 import logging
 import sqlite3
+import uuid
 from datetime import datetime
 from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
@@ -591,6 +593,8 @@ class AgentTask(TimestampMixin, Base):
     # List of task IDs that must be done before this task can be dispatched
     created_by_task_id = Column(String, nullable=True)
     # ID of the task that spawned this one (agent-created subtasks)
+    tags              = Column(JSON, default=list, nullable=False)
+    # Freeform user labels for categorization and filtering
 
     __table_args__ = (
         Index('ix_agent_tasks_status_owner', 'status', 'owner'),
@@ -616,6 +620,20 @@ class RoleBinding(TimestampMixin, Base):
     __table_args__ = (
         Index('ix_role_bindings_owner_role', 'owner', 'role', unique=True),
     )
+
+
+class WorkflowTemplate(TimestampMixin, Base):
+    """Saved Agent Hub workflow template.
+
+    Each step describes a role-targeted task to create and an optional dependency
+    on an earlier step by index.
+    """
+    __tablename__ = "workflow_templates"
+
+    id    = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner = Column(String, index=True)
+    name  = Column(String, nullable=False)
+    steps = Column(JSON, nullable=False, default=list)
 
 
 class AgentEvent(TimestampMixin, Base):
@@ -1664,6 +1682,8 @@ def init_db():
     _migrate_add_role_bindings_table()
     _migrate_add_agent_task_depends_on_column()
     _migrate_add_agent_task_created_by_column()
+    _migrate_add_agent_task_tags_column()
+    _migrate_add_workflow_templates_table()
 
 
 def _migrate_add_agent_task_chain_column():
@@ -1826,6 +1846,54 @@ def _migrate_add_agent_task_created_by_column():
         conn.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"agent_tasks.created_by_task_id migration failed: {e}")
+
+
+def _migrate_add_agent_task_tags_column():
+    """Add tags JSON column to agent_tasks if it doesn't exist."""
+    db = SessionLocal()
+    try:
+        db.query(AgentTask.tags).limit(1).all()
+        return
+    except OperationalError:
+        db.rollback()
+    finally:
+        db.close()
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE agent_tasks ADD COLUMN tags JSON NOT NULL DEFAULT '[]'"))
+        logging.getLogger(__name__).info("Migrated: added tags column to agent_tasks")
+    except OperationalError as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.tags migration failed: {e}")
+
+
+def _migrate_add_workflow_templates_table():
+    """Create workflow_templates table if it does not exist."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_templates (
+                id TEXT NOT NULL,
+                owner TEXT,
+                name TEXT NOT NULL,
+                steps JSON NOT NULL DEFAULT '[]',
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS ix_workflow_templates_owner
+            ON workflow_templates (owner)
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"workflow_templates migration failed: {e}")
 
 
 def _migrate_add_email_smtp_security():
