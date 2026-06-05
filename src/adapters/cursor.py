@@ -8,6 +8,12 @@ import logging
 import os
 from pathlib import Path
 
+# Windows: cursor-sdk uses Unix-only os functions. Patch before any import.
+if not hasattr(os, "get_blocking"):
+    os.get_blocking = lambda fd: True
+if not hasattr(os, "set_blocking"):
+    os.set_blocking = lambda fd, blocking: None
+
 from src.adapters.base import AbstractAdapter, AgentAdapterResult, AdapterProbe
 
 logger = logging.getLogger(__name__)
@@ -72,14 +78,6 @@ class CursorAdapter(AbstractAdapter):
         cwd = workspace or os.getcwd()
 
         try:
-            # Windows: cursor-sdk uses Unix-only os functions.
-            # Patch before importing so the SDK's internals see them.
-            _os = os
-            if not hasattr(_os, "get_blocking"):
-                _os.get_blocking = lambda fd: True
-            if not hasattr(_os, "set_blocking"):
-                _os.set_blocking = lambda fd, blocking: None
-
             cursor_sdk = importlib.import_module("cursor_sdk")
             Agent = cursor_sdk.Agent
             AgentOptions = cursor_sdk.AgentOptions
