@@ -18,6 +18,10 @@ import { makeWindowDraggable } from './windowDrag.js';
 const API_BASE = window.location.origin;
 const FALLBACK_POLL_MS = 10000;  // slow poll only while EventSource is errored
 
+// ── Batch selection state ────────────────────────────────────────────────────
+
+let _selected = new Set();  // Set of selected task IDs
+
 const MODAL_ID = 'agent-hub-modal';
 
 let _open = false;
@@ -112,6 +116,14 @@ function _getModal() {
           <div class="ah-task-items" id="ah-task-items">
             <div class="ah-empty">Loading tasks…</div>
           </div>
+          <div class="ah-batch-bar" id="ah-batch-bar" style="display:none">
+            <span class="ah-batch-count" id="ah-batch-count">0 selected</span>
+            <div class="ah-batch-actions">
+              <button class="ah-batch-btn ah-batch-cancel" id="ah-batch-cancel">Cancel</button>
+              <button class="ah-batch-btn ah-batch-retry" id="ah-batch-retry">Retry</button>
+              <button class="ah-batch-btn ah-batch-delete" id="ah-batch-delete">Delete</button>
+            </div>
+          </div>
         </div>
         <div class="ah-splitter" id="ah-splitter"></div>
         <div class="ah-right-pane" id="ah-task-detail">
@@ -146,6 +158,11 @@ function _getModal() {
   modal.querySelector('#ah-new-task-btn').addEventListener('click', () => _showNewTaskForm());
   modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
+
+  // Batch action bar buttons
+  modal.querySelector('#ah-batch-cancel').addEventListener('click', () => _executeBatchAction('cancel'));
+  modal.querySelector('#ah-batch-retry').addEventListener('click', () => _executeBatchAction('retry'));
+  modal.querySelector('#ah-batch-delete').addEventListener('click', () => _executeBatchAction('delete'));
 
   // Debounced keyword search
   const searchInput = modal.querySelector('#ah-search-input');
@@ -382,6 +399,7 @@ function _renderFromCache() {
   _renderTaskList(tasks);
   _updateBadge(tasks);
   _tickAllListTimers();  // populate fresh timer spans immediately
+  _updateActionBar();     // show/hide batch bar based on selection
 }
 
 function _renderTaskList(tasks) {
@@ -391,7 +409,13 @@ function _renderTaskList(tasks) {
     container.innerHTML = '<div class="ah-empty">No tasks yet. Click "+ New Task" to create one.</div>';
     return;
   }
-  container.innerHTML = tasks.map(t => {
+  const selectAllChecked = tasks.length > 0 && tasks.every(t => _selected.has(t.id));
+  const selectAllHtml = `<div class="ah-select-all-row">
+    <input type="checkbox" class="ah-select-all-checkbox" id="ah-select-all"
+      ${selectAllChecked ? 'checked' : ''}>
+    <label for="ah-select-all" class="ah-select-all-label">Select all</label>
+  </div>`;
+  container.innerHTML = selectAllHtml + tasks.map(t => {
     const activeClass = t.id === _selectedTaskId ? 'ah-task-item--active' : '';
     const statusDot = _statusDot(t.status);
     const runningAttr = t.started_at
@@ -399,9 +423,11 @@ function _renderTaskList(tasks) {
     const terminalStatuses = ['done', 'cancelled', 'blocked'];
     const doneAttr = terminalStatuses.includes(t.status) && t.started_at && t.updated_at
       ? `data-done-at="${t.updated_at}"` : '';
+    const checked = _selected.has(t.id) ? 'checked' : '';
     return `
       <div class="ah-task-item ${activeClass}" data-task-id="${t.id}" data-status="${t.status}" ${runningAttr} ${doneAttr}>
         <div class="ah-task-item-header">
+          <input type="checkbox" class="ah-task-checkbox" data-id="${t.id}" ${checked}>
           ${statusDot}
           <span class="ah-task-title">${_esc(t.title)}</span>
           <button class="ah-task-delete-btn" data-delete-id="${t.id}" title="Delete task">×</button>
@@ -423,6 +449,21 @@ function _renderTaskList(tasks) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       _deleteTask(btn.dataset.deleteId);
+    });
+  });
+  // Select-all checkbox
+  const selectAllEl = container.querySelector('#ah-select-all');
+  if (selectAllEl) {
+    selectAllEl.addEventListener('change', (e) => {
+      e.stopPropagation();
+      _onSelectAll(e.target.checked);
+    });
+  }
+  // Per-item checkboxes
+  container.querySelectorAll('.ah-task-checkbox').forEach(cb => {
+    cb.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _onCheckboxChange(cb.dataset.id, cb.checked);
     });
   });
 }
@@ -1106,6 +1147,78 @@ function _actorClass(actor) {
     cursor: 'cursor', coordinator: 'system',
   };
   return classes[actor] || 'default';
+}
+
+// ── Batch operations ─────────────────────────────────────────────────────────
+
+function _onCheckboxChange(id, checked) {
+  if (checked) {
+    _selected.add(id);
+  } else {
+    _selected.delete(id);
+  }
+  _updateActionBar();
+  // Update select-all checkbox state
+  const selectAll = document.getElementById('ah-select-all');
+  const allItems = document.querySelectorAll('.ah-task-checkbox');
+  if (selectAll && allItems.length) {
+    selectAll.checked = Array.from(allItems).every(cb => cb.checked);
+  }
+}
+
+function _onSelectAll(checked) {
+  const allCbs = document.querySelectorAll('.ah-task-checkbox');
+  allCbs.forEach(cb => {
+    cb.checked = checked;
+    if (checked) {
+      _selected.add(cb.dataset.id);
+    } else {
+      _selected.delete(cb.dataset.id);
+    }
+  });
+  _updateActionBar();
+}
+
+function _updateActionBar() {
+  const bar = document.getElementById('ah-batch-bar');
+  const count = document.getElementById('ah-batch-count');
+  if (!bar || !count) return;
+  if (_selected.size > 0) {
+    bar.style.display = 'flex';
+    count.textContent = `${_selected.size} selected`;
+  } else {
+    bar.style.display = 'none';
+  }
+}
+
+async function _executeBatchAction(action) {
+  if (_selected.size === 0) return;
+  const taskIds = Array.from(_selected);
+  try {
+    const r = await fetch(`${API_BASE}/api/agent-hub/tasks/batch`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, task_ids: taskIds }),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      _showToast(`${data.results.succeeded} task(s) ${action}d`);
+      _selected.clear();
+      _updateActionBar();
+      // Re-fetch from server to get authoritative state
+      _fetchAndRender();
+    } else {
+      _showToast('Batch operation failed');
+    }
+    // If any failures, show them
+    if (data.results && data.results.failed && data.results.failed.length) {
+      const msgs = data.results.failed.map(f => `${f.id.slice(0,8)}: ${f.error}`).join('; ');
+      _showToast(`Failed: ${msgs}`);
+    }
+  } catch (err) {
+    _showToast(`Batch error: ${err.message}`);
+  }
 }
 
 function _showToast(msg) {

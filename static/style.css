@@ -21628,6 +21628,46 @@ body:not(.welcome-ready) #welcome-screen {
   border: 1px solid var(--border, #333); border-radius: 3px;
 }
 
+/* ── Batch operations ──────────────────────────────────────────────── */
+
+.ah-select-all-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px; border-bottom: 1px solid var(--border, #333);
+  font-size: 12px; opacity: 0.7;
+}
+.ah-select-all-checkbox {
+  cursor: pointer; accent-color: var(--accent, #5b8abf);
+}
+.ah-select-all-label {
+  cursor: pointer; user-select: none;
+}
+.ah-task-checkbox {
+  cursor: pointer; accent-color: var(--accent, #5b8abf);
+  flex-shrink: 0; margin-right: 4px;
+}
+.ah-batch-bar {
+  display: none; align-items: center; justify-content: space-between;
+  padding: 6px 10px; border-top: 1px solid var(--border, #333);
+  background: color-mix(in srgb, var(--bg, #111) 95%, var(--accent, #5b8abf));
+  font-size: 12px;
+}
+.ah-batch-count {
+  font-weight: 500; opacity: 0.8;
+}
+.ah-batch-actions {
+  display: flex; gap: 4px;
+}
+.ah-batch-btn {
+  font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 3px; border: 1px solid var(--border, #333);
+  background: transparent; cursor: pointer;
+  transition: background 0.15s;
+}
+.ah-batch-btn:hover { background: color-mix(in srgb, currentColor 15%, transparent); }
+.ah-batch-cancel { color: #f0a030; }
+.ah-batch-retry  { color: #5b8abf; }
+.ah-batch-delete { color: #cc4444; }
+
 /* Sidebar notification dot */
 .ah-notif-dot {
   display: inline-flex; align-items: center; justify-content: center;

@@ -781,6 +781,83 @@ def setup_agent_hub_routes() -> APIRouter:
                 "poll_interval": 5,
             }
 
+    # ── Batch Operations ────────────────────────────────────────────────────
+
+    class BatchRequest(BaseModel):
+        action: str  # "delete" | "cancel" | "retry"
+        task_ids: list[str]
+
+    class BatchFailure(BaseModel):
+        id: str
+        error: str
+
+    class BatchResults(BaseModel):
+        succeeded: int = 0
+        failed: list[dict] = []
+
+    class BatchResponse(BaseModel):
+        ok: bool = True
+        results: BatchResults
+
+    @router.post("/tasks/batch")
+    async def batch_tasks(request: Request, body: BatchRequest):
+        """Execute a bulk action (delete/cancel/retry) on multiple tasks.
+
+        Each task is owner-scoped. Failures on individual tasks are captured
+        in ``results.failed`` — the endpoint does not fail-fast.
+        """
+        user = get_current_user(request)
+        if body.action not in ("delete", "cancel", "retry"):
+            raise HTTPException(400,
+                               f"Invalid action: {body.action}. Must be delete, cancel, or retry.")
+        if not body.task_ids:
+            raise HTTPException(400, "task_ids must not be empty")
+
+        db = SessionLocal()
+        results = BatchResults()
+        try:
+            for task_id in body.task_ids:
+                task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
+                if not task:
+                    results.failed.append({"id": task_id, "error": "Task not found"})
+                    continue
+                if user and task.owner and task.owner != user:
+                    results.failed.append({"id": task_id, "error": "Not your task"})
+                    continue
+
+                try:
+                    if body.action == "delete":
+                        db.delete(task)
+                        db.flush()
+                    elif body.action == "cancel":
+                        task.status = "cancelled"
+                        task.locked_by = None
+                        db.flush()
+                    elif body.action == "retry":
+                        task.status = "queued"
+                        task.locked_by = None
+                        task.attempts = 0
+                        db.flush()
+
+                    results.succeeded += 1
+
+                    # Publish update for non-delete actions
+                    if body.action != "delete":
+                        result_dict = _task_to_dict(task)
+                        from src.agent_hub_events import publish
+                        publish(user or "", "task_updated", result_dict)
+
+                except Exception as exc:
+                    db.rollback()
+                    results.failed.append({"id": task_id, "error": str(exc)})
+
+            if results.succeeded > 0:
+                db.commit()
+
+            return BatchResponse(results=results)
+        finally:
+            db.close()
+
     return router
 
 
