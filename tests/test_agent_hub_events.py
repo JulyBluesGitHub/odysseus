@@ -912,3 +912,68 @@ class TestTags:
         tasks = r2.json()["tasks"]
         task = next(t for t in tasks if t["id"] == task_id)
         assert task["tags"] == [tag]
+
+
+class TestPriorities:
+    """Tests for Agent Hub task priorities."""
+
+    def test_create_with_priority(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Priority high create",
+            "status": "draft",
+            "priority": "high",
+        })
+        assert r.status_code == 201
+        assert r.json()["priority"] == "high"
+
+    def test_default_priority(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Priority default create",
+            "status": "draft",
+        })
+        assert r.status_code == 201
+        assert r.json()["priority"] == "medium"
+
+    def test_filter_by_priority(self, client):
+        marker = uuid.uuid4().hex
+        high = client.post("/api/agent-hub/tasks", json={
+            "title": f"Priority high {marker}",
+            "status": "draft",
+            "priority": "high",
+        })
+        low = client.post("/api/agent-hub/tasks", json={
+            "title": f"Priority low {marker}",
+            "status": "draft",
+            "priority": "low",
+        })
+        assert high.status_code == 201
+        assert low.status_code == 201
+
+        r = client.get("/api/agent-hub/tasks?priority=high")
+        assert r.status_code == 200
+        tasks = r.json()["tasks"]
+        assert all(t["priority"] == "high" for t in tasks)
+        assert any(t["id"] == high.json()["id"] for t in tasks)
+        assert all(t["id"] != low.json()["id"] for t in tasks)
+
+    def test_reject_invalid_priority(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Priority invalid",
+            "status": "draft",
+            "priority": "urgent",
+        })
+        assert r.status_code == 400
+
+    def test_update_priority(self, client):
+        r = client.post("/api/agent-hub/tasks", json={
+            "title": "Priority update",
+            "status": "draft",
+        })
+        assert r.status_code == 201
+        task_id = r.json()["id"]
+
+        r2 = client.put(f"/api/agent-hub/tasks/{task_id}", json={
+            "priority": "low",
+        })
+        assert r2.status_code == 200
+        assert r2.json()["priority"] == "low"

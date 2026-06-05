@@ -98,6 +98,12 @@ function _getModal() {
             <input type="text" class="ah-filter ah-search-input" id="ah-search-input" placeholder="Search tasks…">
             <button class="ah-btn ah-btn-primary" id="ah-new-task-btn">+ New Task</button>
             <input type="text" class="ah-filter ah-tag-input" id="ah-tag-filter" placeholder="Filter by tag...">
+            <select class="ah-filter ah-priority-filter" id="ah-priority-filter">
+              <option value="">All Priorities</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
             <select class="ah-filter" id="ah-status-filter">
               <option value="">All Statuses</option>
               <option value="draft">Draft</option>
@@ -168,6 +174,7 @@ function _getModal() {
   modal.querySelector('#ah-status-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-owner-filter').addEventListener('change', () => _renderFromCache());
   modal.querySelector('#ah-tag-filter').addEventListener('change', () => _renderFromCache());
+  modal.querySelector('#ah-priority-filter').addEventListener('change', () => _renderFromCache());
 
   // Sort dropdown
   modal.querySelector('#ah-sort').addEventListener('change', () => _renderFromCache());
@@ -314,15 +321,18 @@ async function _fetchTasks() {
   const ownerEl = document.getElementById('ah-owner-filter');
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
+  const priorityEl = document.getElementById('ah-priority-filter');
   const params = new URLSearchParams();
   const status = statusEl?.value;
   const owner = ownerEl?.value;
   const search = searchEl?.value.trim();
   const tag = tagEl?.value.trim();
+  const priority = priorityEl?.value;
   if (status) params.set('status', status);
   if (owner) params.set('owner', owner);
   if (search) params.set('q', search);
   if (tag) params.set('tag', tag);
+  if (priority) params.set('priority', priority);
   const url = `${API_BASE}/api/agent-hub/tasks${params.toString() ? '?' + params : ''}`;
   try {
     const res = await fetch(url, { credentials: 'same-origin' });
@@ -382,10 +392,12 @@ function _getFilteredTasks() {
   const ownerEl = document.getElementById('ah-owner-filter');
   const searchEl = document.getElementById('ah-search-input');
   const tagEl = document.getElementById('ah-tag-filter');
+  const priorityEl = document.getElementById('ah-priority-filter');
   const status = statusEl?.value || '';
   const owner = ownerEl?.value || '';
   const search = (searchEl?.value || '').trim().toLowerCase();
   const tag = (tagEl?.value || '').trim().toLowerCase();
+  const priority = priorityEl?.value || '';
 
   let tasks = Array.from(_taskMap.values());
 
@@ -394,6 +406,9 @@ function _getFilteredTasks() {
   }
   if (owner) {
     tasks = tasks.filter(t => t.current_owner === owner);
+  }
+  if (priority) {
+    tasks = tasks.filter(t => (t.priority || 'medium') === priority);
   }
   if (search) {
     tasks = tasks.filter(t =>
@@ -455,12 +470,14 @@ function _renderTaskList(tasks) {
     const doneAttr = terminalStatuses.includes(t.status) && t.started_at && t.updated_at
       ? `data-done-at="${t.updated_at}"` : '';
     const checked = _selected.has(t.id) ? 'checked' : '';
+    const priority = ['high', 'medium', 'low'].includes(t.priority) ? t.priority : 'medium';
     const tagsHtml = (t.tags || []).map(tag => `<span class="ah-task-tag">${_esc(tag)}</span>`).join('');
     return `
       <div class="ah-task-item ${activeClass}" data-task-id="${t.id}" data-status="${t.status}" ${runningAttr} ${doneAttr}>
         <div class="ah-task-item-header">
           <input type="checkbox" class="ah-task-checkbox" data-id="${t.id}" ${checked}>
           ${statusDot}
+          <span class="ah-priority-dot ah-priority--${priority}" title="${priority} priority"></span>
           <span class="ah-task-title">${_esc(t.title)}</span>
           ${tagsHtml}
           <div class="ah-task-actions">
@@ -901,6 +918,11 @@ async function _showNewTaskForm() {
           <option value="implementer">Implementer</option>
           <option value="verifier">Verifier</option>
         </select>
+        <select class="ah-input" id="ah-new-priority">
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+          <option value="low">Low</option>
+        </select>
       </div>
       <div class="ah-new-task-row">
         <input class="ah-input" id="ah-new-chain" placeholder="Triggered by task ID (optional)" value="" style="flex:1;">
@@ -961,7 +983,8 @@ async function _showNewTaskForm() {
     const chainId = document.getElementById('ah-new-chain').value.trim();
     const sandbox = document.getElementById('ah-new-sandbox').value;
     const role = document.getElementById('ah-new-role')?.value || undefined;
-    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, sandbox_mode: sandbox, tags: _newTags };
+    const priority = document.getElementById('ah-new-priority').value;
+    const body = { title, objective, current_owner: owner || undefined, role, phase: phase || undefined, priority, sandbox_mode: sandbox, tags: _newTags };
     // Auto-queue if assigned to a non-user agent OR a role is set
     if ((owner && owner !== 'user') || role) body.status = 'queued';
     const task = await _apiCall('POST', '/api/agent-hub/tasks', body);

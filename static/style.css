@@ -21478,7 +21478,7 @@ body:not(.welcome-ready) #welcome-screen {
 .ah-header { display: flex; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); gap: 8px; }
 .ah-header-status { font-size: 11px; opacity: 0.6; margin-left: auto; }
 .ah-status-live { color: #44aa44; }
-.ah-status-idle {
+.ah-status-idle { color: #888; }
 .ah-refresh-btn { background: none; border: none; color: var(--fg); opacity: 0.5; cursor: pointer; font-size: 14px; padding: 2px 4px; }
 .ah-refresh-btn:hover { opacity: 1; }
 .ah-detail-header { margin-bottom: 10px; }

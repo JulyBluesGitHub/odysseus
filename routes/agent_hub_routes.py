@@ -49,12 +49,14 @@ VALID_EVENT_TYPES = {"message", "status_change", "approval", "error", "lock", "c
 VALID_OWNERS = {"user", "hermes", "codex", "cursor"}
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 VALID_ROLES = {"diagnoser", "implementer", "verifier"}
+VALID_PRIORITIES = {"high", "medium", "low"}
 
 
 class TaskCreate(BaseModel):
     title: str = "Untitled Task"
     objective: Optional[str] = None
     status: str = "draft"
+    priority: str = "medium"
     phase: Optional[str] = None
     current_owner: Optional[str] = None
     role: Optional[str] = None
@@ -72,6 +74,7 @@ class TaskUpdate(BaseModel):
     title: Optional[str] = None
     objective: Optional[str] = None
     status: Optional[str] = None
+    priority: Optional[str] = None
     phase: Optional[str] = None
     current_owner: Optional[str] = None
     role: Optional[str] = None
@@ -139,6 +142,7 @@ def _task_to_dict(t: AgentTask) -> dict:
         "title": t.title,
         "objective": t.objective,
         "status": t.status,
+        "priority": t.priority or "medium",
         "phase": t.phase,
         "current_owner": t.current_owner,
         "role": t.role,
@@ -508,8 +512,9 @@ def setup_agent_hub_routes() -> APIRouter:
         owner_agent: Optional[str] = Query(None, alias="owner"),
         q: Optional[str] = Query(None, description="Free-text search on title and objective"),
         tag: Optional[str] = Query(None),
+        priority: Optional[str] = Query(None),
     ):
-        """List Agent Hub tasks, optionally filtered by status, owner, tag, and/or keyword search."""
+        """List Agent Hub tasks, optionally filtered by status, owner, priority, tag, and/or keyword search."""
         user = get_current_user(request)
         db = SessionLocal()
         try:
@@ -522,6 +527,10 @@ def setup_agent_hub_routes() -> APIRouter:
                 qobj = qobj.filter(AgentTask.status == status)
             if owner_agent:
                 qobj = qobj.filter(AgentTask.current_owner == owner_agent)
+            if priority:
+                if priority not in VALID_PRIORITIES:
+                    raise HTTPException(400, f"Invalid priority: {priority}")
+                qobj = qobj.filter(AgentTask.priority == priority)
             if tag:
                 qobj = qobj.filter(AgentTask.tags.contains([tag]))
             if q:
@@ -541,6 +550,8 @@ def setup_agent_hub_routes() -> APIRouter:
         user = get_current_user(request)
         if body.status not in VALID_STATUSES:
             raise HTTPException(400, f"Invalid status: {body.status}")
+        if body.priority not in VALID_PRIORITIES:
+            raise HTTPException(400, f"Invalid priority: {body.priority}")
         if body.current_owner and body.current_owner not in VALID_OWNERS:
             raise HTTPException(400, f"Invalid current_owner: {body.current_owner}")
         if body.sandbox_mode not in VALID_SANDBOX_MODES:
@@ -564,6 +575,7 @@ def setup_agent_hub_routes() -> APIRouter:
                 title=body.title,
                 objective=body.objective,
                 status=body.status,
+                priority=body.priority,
                 phase=body.phase,
                 current_owner=body.current_owner,
                 role=body.role,
@@ -628,6 +640,10 @@ def setup_agent_hub_routes() -> APIRouter:
                 task.title = body.title
             if body.objective is not None:
                 task.objective = body.objective
+            if body.priority is not None:
+                if body.priority not in VALID_PRIORITIES:
+                    raise HTTPException(400, f"Invalid priority: {body.priority}")
+                task.priority = body.priority
             if body.phase is not None:
                 task.phase = body.phase
             if body.current_owner is not None:

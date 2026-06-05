@@ -573,6 +573,8 @@ class AgentTask(TimestampMixin, Base):
     objective         = Column(Text, nullable=True)
     status            = Column(String, default="draft", index=True)
     # draft | queued | running | waiting_for_approval | blocked | done | cancelled
+    priority          = Column(String, default="medium", nullable=False)
+    # high | medium | low
     phase             = Column(String, nullable=True)
     # planning | review | implementation | verification | handoff
     current_owner     = Column(String, nullable=True)
@@ -1683,6 +1685,7 @@ def init_db():
     _migrate_add_agent_task_depends_on_column()
     _migrate_add_agent_task_created_by_column()
     _migrate_add_agent_task_tags_column()
+    _migrate_add_agent_task_priority_column()
     _migrate_add_workflow_templates_table()
 
 
@@ -1865,6 +1868,27 @@ def _migrate_add_agent_task_tags_column():
         logging.getLogger(__name__).info("Migrated: added tags column to agent_tasks")
     except OperationalError as e:
         logging.getLogger(__name__).warning(f"agent_tasks.tags migration failed: {e}")
+
+
+def _migrate_add_agent_task_priority_column():
+    """Add priority column to agent_tasks if it doesn't exist."""
+    db = SessionLocal()
+    try:
+        db.query(AgentTask.priority).limit(1).all()
+        return
+    except OperationalError:
+        db.rollback()
+    finally:
+        db.close()
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE agent_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"
+            ))
+        logging.getLogger(__name__).info("Migrated: added priority column to agent_tasks")
+    except OperationalError as e:
+        logging.getLogger(__name__).warning(f"agent_tasks.priority migration failed: {e}")
 
 
 def _migrate_add_workflow_templates_table():
