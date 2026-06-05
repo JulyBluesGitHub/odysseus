@@ -1,98 +1,45 @@
-"""Codex adapter — OpenAI Codex CLI integration.
-
-Installed via ``npm install -g @openai/codex``. On Windows the npm global
-binary is a .cmd wrapper; this adapter resolves the full path with ``where``
-and uses it for all subprocess invocations to avoid shell-resolution issues.
-
-The adapter:
-1. Probes: resolves the CLI path, checks it's not a sandboxed WindowsApps binary,
-   verifies ``codex exec --help`` succeeds, and detects ``--json`` support.
-2. Executes: calls ``<resolved_path> exec --json "<prompt>"`` (plain-text fallback
-   if --json unavailable).
-3. NEVER executes returned commands directly — output is stored as an event only.
-"""
+"""Codex adapter — OpenAI Codex Python SDK integration."""
 
 from __future__ import annotations
 
+import importlib
 import logging
-import shutil
-import subprocess
+from typing import Any
 
 from src.adapters.base import AbstractAdapter, AgentAdapterResult, AdapterProbe
 
 logger = logging.getLogger(__name__)
 
-# Known WindowsApps paths that fail with Access is denied
-_BLOCKED_PREFIXES = (
-    "C:\\Program Files\\WindowsApps\\",
-)
-
-# Valid sandbox modes accepted by Codex CLI --sandbox flag
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 
 
 class CodexAdapter(AbstractAdapter):
-    """Guarded Codex CLI adapter. Probe must pass before any dispatch."""
+    """Runs Agent Hub tasks through the openai-codex SDK."""
 
-    def __init__(self, cli_command: str = "codex"):
+    def __init__(self, cli_command: str | None = None):
         self._cli = cli_command
-        self._resolved_path: str | None = None
         self._probe_cache: AdapterProbe | None = None
 
     async def probe(self) -> AdapterProbe:
-        """Check whether the Codex CLI is reachable and supports --json.
-
-        Caches the result so repeated calls don't keep spawning subprocesses.
-        """
+        """Check whether the openai-codex SDK can be imported."""
         if self._probe_cache is not None:
             return self._probe_cache
 
-        try:
-            # Resolve the binary path (shutil.which handles Windows PATHEXT correctly)
-            cli_path = shutil.which(self._cli)
-            if cli_path is None:
-                self._probe_cache = AdapterProbe(
-                    available=False,
-                    error=f"'{self._cli}' not found on PATH",
-                )
-                return self._probe_cache
-
-            self._resolved_path = cli_path
-
-            # Check for known-blocked paths
-            for prefix in _BLOCKED_PREFIXES:
-                if cli_path.startswith(prefix):
-                    self._probe_cache = AdapterProbe(
-                        available=False,
-                        cli_path=cli_path,
-                        error=f"WindowsApps sandboxed binary — cannot invoke headlessly: {cli_path}",
-                    )
-                    return self._probe_cache
-
-            # Try a simple invocation to verify it runs
-            test = subprocess.run(
-                [cli_path, "exec", "--help"],
-                capture_output=True, text=True, timeout=15,
-            )
-            if test.returncode != 0:
-                self._probe_cache = AdapterProbe(
-                    available=False,
-                    cli_path=cli_path,
-                    error=f"CLI returned exit code {test.returncode}: {test.stderr[:200]}",
-                )
-                return self._probe_cache
-
-            # Check if --json flag is recognized
-            supports_json = "--json" in (test.stdout + test.stderr)
-
+        if self._cli and self._cli != "codex":
             self._probe_cache = AdapterProbe(
-                available=True,
-                cli_path=cli_path,
-                supports_json=supports_json,
-                version=None,
+                available=False,
+                error=f"'{self._cli}' not found on PATH",
             )
             return self._probe_cache
 
+        try:
+            openai_codex = importlib.import_module("openai_codex")
+        except ImportError:
+            self._probe_cache = AdapterProbe(
+                available=False,
+                error="openai-codex not installed",
+            )
+            return self._probe_cache
         except Exception as exc:
             self._probe_cache = AdapterProbe(
                 available=False,
@@ -100,81 +47,112 @@ class CodexAdapter(AbstractAdapter):
             )
             return self._probe_cache
 
-    async def run(self, task, events: list) -> AgentAdapterResult:
-        """Attempt to run the Codex CLI. Returns an error result if unavailable."""
+        self._probe_cache = AdapterProbe(
+            available=True,
+            supports_json=False,
+            version=getattr(openai_codex, "version", None),
+        )
+        return self._probe_cache
+
+    async def run(
+        self,
+        task,
+        events: list | None = None,
+        workspace: str | None = None,
+        sandbox_mode: str | None = None,
+    ) -> AgentAdapterResult:
+        """Run the task through an AsyncCodex thread."""
+        sandbox_name = _sandbox_name(task, sandbox_mode)
+        if sandbox_name not in CODEX_SANDBOX_MODES:
+            return _blocked(
+                f"Invalid sandbox_mode: {sandbox_name}",
+                (
+                    f"Task sandbox_mode '{sandbox_name}' is not one of "
+                    f"{sorted(CODEX_SANDBOX_MODES)}."
+                ),
+            )
+
         probe = await self.probe()
         if not probe.available:
-            return AgentAdapterResult(
-                summary=f"Codex unavailable: {probe.error}",
-                content=(
-                    f"Codex CLI could not be invoked.\n"
-                    f"  Path: {probe.cli_path or 'unknown'}\n"
-                    f"  Error: {probe.error}\n"
-                    f"\n"
-                    f"The Codex adapter requires a non-sandboxed CLI binary.\n"
-                    f"Fix the WindowsApps accessibility before enabling this adapter."
+            return _blocked(
+                f"Codex unavailable: {probe.error}",
+                (
+                    "Codex SDK could not be imported.\n"
+                    f"  Error: {probe.error}\n\n"
+                    "Install it in the Odysseus venv with: pip install openai-codex"
                 ),
-                proposed_status="blocked",
-                needs_approval=False,
             )
 
-        # CLI is available — invoke it
-        title = getattr(task, "title", "Untitled")
-        objective = getattr(task, "objective", "") or "(no objective)"
-
-        # Validate and apply sandbox mode
-        sandbox = getattr(task, "sandbox_mode", "workspace-write") or "workspace-write"
-        if sandbox not in CODEX_SANDBOX_MODES:
-            return AgentAdapterResult(
-                summary=f"Invalid sandbox_mode: {sandbox}",
-                content=(
-                    f"Task sandbox_mode '{sandbox}' is not one of "
-                    f"{sorted(CODEX_SANDBOX_MODES)}.\n"
-                    f"This is a configuration error — the task cannot run "
-                    f"until sandbox_mode is corrected."
-                ),
-                proposed_status="blocked",
-                needs_approval=False,
-            )
-
-        prompt = (
-            f"Task: {title}\n\n"
-            f"Objective: {objective}\n\n"
-            f"Respond concisely. If this requires code, provide the implementation.\n"
-            f"End with a line: STATUS: <done|waiting_for_approval|blocked>"
-        )
+        prompt = _task_prompt(task)
 
         try:
-            args = [self._resolved_path or self._cli, "exec"]
-            if probe.supports_json:
-                args.append("--json")
-            args.extend(["--sandbox", sandbox])
-            args.append(prompt)
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=300,
-            )
-            output = result.stdout.strip() or result.stderr.strip()
-            if result.returncode != 0:
-                return AgentAdapterResult(
-                    summary=f"Codex exited with code {result.returncode}",
-                    content=output,
-                    proposed_status="queued",
-                )
+            openai_codex = importlib.import_module("openai_codex")
+            AsyncCodex = openai_codex.AsyncCodex
+            sandbox = _sandbox_from_name(openai_codex.Sandbox, sandbox_name)
+
+            async with AsyncCodex() as codex:
+                thread = await codex.thread_start(sandbox=sandbox, cwd=workspace)
+                result = await thread.run(prompt)
+
+            output = getattr(result, "final_response", "") or ""
             return AgentAdapterResult(
-                summary=output.split("\n")[0][:200] if output else f"Codex response to: {title}",
+                summary=_summary(output, getattr(task, "title", "Untitled")),
                 content=output,
                 proposed_status="done",
                 proposed_owner="user",
-            )
-        except subprocess.TimeoutExpired:
-            return AgentAdapterResult(
-                summary="Codex timed out after 300s",
-                content="The Codex CLI did not complete within the timeout.",
-                proposed_status="queued",
+                needs_approval=False,
+                metadata={
+                    "usage": getattr(result, "usage", None),
+                    "items": _serialisable_items(getattr(result, "items", None)),
+                },
             )
         except Exception as exc:
-            return AgentAdapterResult(
-                summary=f"Codex error: {exc}",
-                content=str(exc),
-                proposed_status="queued",
-            )
+            logger.exception("Codex adapter failed")
+            return _blocked(f"Codex error: {exc}", str(exc))
+
+
+def _sandbox_from_name(sandbox_cls: Any, sandbox_name: str):
+    return {
+        "read-only": sandbox_cls.read_only,
+        "workspace-write": sandbox_cls.workspace_write,
+        "danger-full-access": sandbox_cls.full_access,
+    }[sandbox_name]
+
+
+def _sandbox_name(task, explicit: str | None) -> str:
+    value = explicit if explicit is not None else getattr(task, "sandbox_mode", None)
+    return value if isinstance(value, str) and value else "workspace-write"
+
+
+def _task_prompt(task) -> str:
+    return (
+        getattr(task, "title", None)
+        or getattr(task, "objective", None)
+        or ""
+    )
+
+
+def _summary(output: str, title: str) -> str:
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:200]
+    return f"Codex response to: {title}"
+
+
+def _serialisable_items(items):
+    if items is None:
+        return None
+    try:
+        return list(items)
+    except TypeError:
+        return str(items)
+
+
+def _blocked(summary: str, content: str) -> AgentAdapterResult:
+    return AgentAdapterResult(
+        summary=summary,
+        content=content,
+        proposed_status="blocked",
+        needs_approval=False,
+    )

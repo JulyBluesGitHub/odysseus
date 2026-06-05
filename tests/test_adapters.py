@@ -235,6 +235,292 @@ class TestCodexAdapterUnit:
         assert "bananas" in result.summary
 
 
+# ── CodexAdapter SDK integration behavior ────────────────────────────────────
+
+class TestCodexAdapterSDK:
+
+    def test_probe_available_when_sdk_installed(self, monkeypatch):
+        from src.adapters.codex import CodexAdapter
+        import asyncio
+        import sys
+        import types
+
+        fake_sdk = types.SimpleNamespace(version="1.2.3")
+        monkeypatch.setitem(sys.modules, "openai_codex", fake_sdk)
+
+        adapter = CodexAdapter()
+        result = asyncio.run(adapter.probe())
+
+        assert result.available is True
+        assert result.version == "1.2.3"
+
+    def test_probe_unavailable_when_sdk_missing(self):
+        from src.adapters.codex import CodexAdapter
+        import asyncio
+        from unittest.mock import patch
+
+        adapter = CodexAdapter()
+        with patch("importlib.import_module", side_effect=ImportError):
+            result = asyncio.run(adapter.probe())
+
+        assert result.available is False
+        assert result.error == "openai-codex not installed"
+
+    def test_run_returns_result(self, monkeypatch):
+        from src.adapters.codex import CodexAdapter
+        import asyncio
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        captured = {}
+
+        class FakeThread:
+            async def run(self, prompt):
+                captured["prompt"] = prompt
+                return types.SimpleNamespace(
+                    final_response="Implemented the task.",
+                    items=["item-1"],
+                    usage={"input_tokens": 10},
+                )
+
+        class FakeAsyncCodex:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def thread_start(self, sandbox=None, cwd=None):
+                captured["sandbox"] = sandbox
+                captured["cwd"] = cwd
+                return FakeThread()
+
+        fake_sandbox = types.SimpleNamespace(
+            read_only="ro",
+            workspace_write="ww",
+            full_access="fa",
+        )
+        fake_sdk = types.SimpleNamespace(
+            version="1.2.3",
+            AsyncCodex=FakeAsyncCodex,
+            Sandbox=fake_sandbox,
+        )
+        monkeypatch.setitem(sys.modules, "openai_codex", fake_sdk)
+
+        adapter = CodexAdapter()
+        task = MagicMock()
+        task.title = "Do it"
+        task.objective = "Fallback objective"
+        task.sandbox_mode = "workspace-write"
+
+        result = asyncio.run(adapter.run(task, [], workspace="C:/repo"))
+
+        assert result.content == "Implemented the task."
+        assert result.summary == "Implemented the task."
+        assert result.proposed_status == "done"
+        assert result.metadata["usage"] == {"input_tokens": 10}
+        assert captured["prompt"] == "Do it"
+        assert captured["sandbox"] == "ww"
+        assert captured["cwd"] == "C:/repo"
+
+    def test_run_rejects_invalid_sandbox_mode(self):
+        from src.adapters.codex import CodexAdapter
+        import asyncio
+        from unittest.mock import MagicMock
+
+        adapter = CodexAdapter()
+        task = MagicMock()
+        task.title = "Test"
+        task.objective = "Something"
+        task.sandbox_mode = "bad"
+
+        result = asyncio.run(adapter.run(task, []))
+
+        assert result.proposed_status == "blocked"
+        assert "Invalid sandbox_mode" in result.summary
+
+    def test_run_handles_exception(self, monkeypatch):
+        from src.adapters.codex import CodexAdapter
+        import asyncio
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        class FakeAsyncCodex:
+            async def __aenter__(self):
+                raise RuntimeError("sdk exploded")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_sdk = types.SimpleNamespace(
+            version="1.2.3",
+            AsyncCodex=FakeAsyncCodex,
+            Sandbox=types.SimpleNamespace(
+                read_only="ro",
+                workspace_write="ww",
+                full_access="fa",
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "openai_codex", fake_sdk)
+
+        adapter = CodexAdapter()
+        task = MagicMock()
+        task.title = "Test"
+        task.objective = ""
+        task.sandbox_mode = "workspace-write"
+
+        result = asyncio.run(adapter.run(task, []))
+
+        assert result.proposed_status == "blocked"
+        assert "sdk exploded" in result.summary
+
+
+# ── CursorAdapter ─────────────────────────────────────────────────────────────
+
+class TestCursorAdapter:
+
+    def test_probe_unavailable_when_sdk_missing(self):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        from unittest.mock import patch
+
+        adapter = CursorAdapter()
+        with patch("importlib.import_module", side_effect=ImportError):
+            result = asyncio.run(adapter.probe())
+
+        assert result.available is False
+        assert result.error == "cursor-sdk not installed"
+
+    def test_probe_unavailable_when_no_api_key(self, monkeypatch, tmp_path):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        import sys
+        import types
+        from pathlib import Path
+
+        monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setitem(sys.modules, "cursor_sdk", types.SimpleNamespace(version="0.1.0"))
+
+        adapter = CursorAdapter()
+        result = asyncio.run(adapter.probe())
+
+        assert result.available is False
+        assert result.error == "CURSOR_API_KEY not set"
+
+    def test_probe_available_with_key(self, monkeypatch):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        import sys
+        import types
+
+        monkeypatch.setenv("CURSOR_API_KEY", "test-key")
+        monkeypatch.setitem(sys.modules, "cursor_sdk", types.SimpleNamespace(version="0.1.0"))
+
+        adapter = CursorAdapter()
+        result = asyncio.run(adapter.probe())
+
+        assert result.available is True
+        assert result.version == "0.1.0"
+
+    def test_run_returns_result(self, monkeypatch):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        captured = {}
+
+        class FakeLocalAgentOptions:
+            def __init__(self, cwd=None, force=False):
+                captured["cwd"] = cwd
+                captured["force"] = force
+
+        class FakeAgent:
+            @staticmethod
+            def prompt(prompt, model=None, local=None):
+                captured["prompt"] = prompt
+                captured["model"] = model
+                captured["local"] = local
+                return "Cursor completed the task."
+
+        fake_sdk = types.SimpleNamespace(
+            version="0.1.0",
+            Agent=FakeAgent,
+            LocalAgentOptions=FakeLocalAgentOptions,
+        )
+        monkeypatch.setitem(sys.modules, "cursor_sdk", fake_sdk)
+
+        adapter = CursorAdapter()
+        task = MagicMock()
+        task.title = "Cursor task"
+        task.objective = "Fallback"
+        task.sandbox_mode = "danger-full-access"
+
+        result = asyncio.run(adapter.run(task, [], workspace="C:/repo"))
+
+        assert result.content == "Cursor completed the task."
+        assert result.summary == "Cursor completed the task."
+        assert result.proposed_status == "done"
+        assert captured["prompt"] == "Cursor task"
+        assert captured["model"] == "composer-2.5"
+        assert captured["cwd"] == "C:/repo"
+        assert captured["force"] is True
+
+    def test_run_rejects_invalid_sandbox_mode(self):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        from unittest.mock import MagicMock
+
+        adapter = CursorAdapter()
+        task = MagicMock()
+        task.title = "Test"
+        task.objective = ""
+        task.sandbox_mode = "invalid"
+
+        result = asyncio.run(adapter.run(task, []))
+
+        assert result.proposed_status == "blocked"
+        assert "Invalid sandbox_mode" in result.summary
+
+    def test_run_handles_exception(self, monkeypatch):
+        from src.adapters.cursor import CursorAdapter
+        import asyncio
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        class FakeLocalAgentOptions:
+            def __init__(self, cwd=None, force=False):
+                pass
+
+        class FakeAgent:
+            @staticmethod
+            def prompt(prompt, model=None, local=None):
+                raise RuntimeError("cursor exploded")
+
+        fake_sdk = types.SimpleNamespace(
+            version="0.1.0",
+            Agent=FakeAgent,
+            LocalAgentOptions=FakeLocalAgentOptions,
+        )
+        monkeypatch.setitem(sys.modules, "cursor_sdk", fake_sdk)
+
+        adapter = CursorAdapter()
+        task = MagicMock()
+        task.title = "Test"
+        task.objective = ""
+        task.sandbox_mode = "workspace-write"
+
+        result = asyncio.run(adapter.run(task, []))
+
+        assert result.proposed_status == "blocked"
+        assert "cursor exploded" in result.summary
+
+
 # ── MockAdapter ───────────────────────────────────────────────────────────────
 
 class TestMockAdapter:

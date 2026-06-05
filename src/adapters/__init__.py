@@ -7,7 +7,8 @@ Exports:
     AbstractAdapter     — base class with probe() + run()
     MockAdapter         — echo adapter for testing the coordinator loop
     HermesAdapter       — calls local Ollama model
-    CodexAdapter        — calls Codex CLI (guarded by capability probe)
+    CodexAdapter        — calls OpenAI Codex SDK
+    CursorAdapter       — calls cursor-sdk local agent
 """
 
 from src.adapters.base import (
@@ -20,9 +21,10 @@ from src.adapters.base import (
 from src.adapters.mock import MockAdapter
 from src.adapters.hermes import HermesAdapter
 from src.adapters.codex import CodexAdapter
+from src.adapters.cursor import CursorAdapter
 
 __all__ = [
     "AgentAdapterResult", "AgentAction", "AgentActionResult",
     "AdapterProbe", "AbstractAdapter",
-    "MockAdapter", "HermesAdapter", "CodexAdapter",
+    "MockAdapter", "HermesAdapter", "CodexAdapter", "CursorAdapter",
 ]

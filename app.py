@@ -866,9 +866,11 @@ async def _startup_event():
         from src.adapters.mock import MockAdapter
         from src.adapters.hermes import HermesAdapter
         from src.adapters.codex import CodexAdapter
+        from src.adapters.cursor import CursorAdapter
         register_adapter("mock", MockAdapter())
         register_adapter("hermes", HermesAdapter())
         register_adapter("codex", CodexAdapter())
+        register_adapter("cursor", CursorAdapter())
         _startup_tasks.append(asyncio.create_task(_start_coordinator()))
     except Exception as _e:
         logger.warning("Failed to start Agent Hub coordinator: %s", _e)
